@@ -1233,6 +1233,158 @@ local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local LocalPlayer = Players.LocalPlayer
 
+local roleEspSec = visualsTab:Section("Role ESP", "Right")
+local InnocentESPEnabled = false
+local SheriffESPEnabled = false
+local MurdererESPEnabled = false
+local RoleESP_Highlights = {}
+
+local ROLE_ESP_COLORS = {
+    Innocent = Color3.fromRGB(255, 255, 255),
+    Sheriff = Color3.fromRGB(0, 0, 255),
+    Murderer = Color3.fromRGB(255, 0, 0)
+}
+
+local function hasRoleTool(container, toolName)
+    if not container then return false end
+    for _, item in ipairs(container:GetChildren()) do
+        if item:IsA("Tool") and item.Name == toolName then
+            return true
+        end
+    end
+    return false
+end
+
+local function getPlayerRoleForESP(player)
+    if not player then return nil end
+    local char = player.Character
+    local backpack = player:FindFirstChildOfClass("Backpack")
+
+    if hasRoleTool(char, "Knife") or hasRoleTool(backpack, "Knife") then
+        return "Murderer"
+    end
+    if hasRoleTool(char, "Gun") or hasRoleTool(backpack, "Gun") then
+        return "Sheriff"
+    end
+    return "Innocent"
+end
+
+local function clearRoleESPForPlayer(player)
+    local highlight = RoleESP_Highlights[player]
+    if highlight then
+        highlight:Destroy()
+        RoleESP_Highlights[player] = nil
+    end
+end
+
+local function clearAllRoleESP()
+    for player, highlight in pairs(RoleESP_Highlights) do
+        if highlight then
+            highlight:Destroy()
+        end
+        RoleESP_Highlights[player] = nil
+    end
+end
+
+local function shouldRenderRoleESP(role)
+    if role == "Murderer" then
+        return MurdererESPEnabled
+    elseif role == "Sheriff" then
+        return SheriffESPEnabled
+    elseif role == "Innocent" then
+        return InnocentESPEnabled
+    end
+    return false
+end
+
+local function updateRoleESPForPlayer(player)
+    if player == LocalPlayer then
+        clearRoleESPForPlayer(player)
+        return
+    end
+
+    local char = player.Character
+    if not char or not char.Parent then
+        clearRoleESPForPlayer(player)
+        return
+    end
+
+    local humanoid = char:FindFirstChildOfClass("Humanoid")
+    if humanoid and humanoid.Health <= 0 then
+        clearRoleESPForPlayer(player)
+        return
+    end
+
+    local role = getPlayerRoleForESP(player)
+    if not shouldRenderRoleESP(role) then
+        clearRoleESPForPlayer(player)
+        return
+    end
+
+    local color = ROLE_ESP_COLORS[role] or ROLE_ESP_COLORS.Innocent
+    local highlight = RoleESP_Highlights[player]
+    if not highlight or not highlight.Parent then
+        highlight = Instance.new("Highlight")
+        highlight.Name = "MM2RoleESP"
+        highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+        highlight.FillTransparency = 0.7
+        highlight.OutlineTransparency = 0
+        RoleESP_Highlights[player] = highlight
+    end
+
+    highlight.Adornee = char
+    highlight.FillColor = color
+    highlight.OutlineColor = color
+    if highlight.Parent ~= char then
+        highlight.Parent = char
+    end
+end
+
+local function refreshAllRoleESP()
+    for player in pairs(RoleESP_Highlights) do
+        if not player or player.Parent ~= Players then
+            clearRoleESPForPlayer(player)
+        end
+    end
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        updateRoleESPForPlayer(player)
+    end
+end
+
+roleEspSec:Toggle("Innocents ESP", false, function(state)
+    InnocentESPEnabled = state
+    refreshAllRoleESP()
+end)
+
+roleEspSec:Toggle("Sheriff ESP", false, function(state)
+    SheriffESPEnabled = state
+    refreshAllRoleESP()
+end)
+
+roleEspSec:Toggle("Murderer ESP", false, function(state)
+    MurdererESPEnabled = state
+    refreshAllRoleESP()
+end)
+
+Players.PlayerRemoving:Connect(function(player)
+    clearRoleESPForPlayer(player)
+end)
+
+task.spawn(function()
+    while true do
+        if InnocentESPEnabled or SheriffESPEnabled or MurdererESPEnabled then
+            refreshAllRoleESP()
+            task.wait(0.2)
+        else
+            if next(RoleESP_Highlights) then
+                clearAllRoleESP()
+            end
+            task.wait(0.4)
+        end
+    end
+end)
+
 local GunDropPart = nil
 local GunDropPartPosition = nil
 local SavedHrp = nil
