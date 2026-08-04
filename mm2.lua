@@ -525,7 +525,7 @@ local TimerLabel = Drawing.new("Text")
 TimerLabel.Visible = false
 TimerLabel.Center = true
 TimerLabel.Outline = true
-TimerLabel.Font = 2 -- UI
+TimerLabel.Font = 6 -- UI
 TimerLabel.Size = 28
 TimerLabel.Color = Color3.fromRGB(255, 215, 0)
 TimerLabel.Position = Vector2.new(500, 20) -- Will be updated in Heartbeat
@@ -537,8 +537,7 @@ pcall(function()
     end
 end)
 
-Lib:ApplyThemePreset("Crimson")
-Lib:SetBackgroundEffect("Snow")
+Lib:ApplyThemePreset("Default")
 Lib:SetRounding(0)
 Lib:SetRowLines(true)
 
@@ -1129,182 +1128,6 @@ task.spawn(function()
         task.wait(0.2)
     end
 end)
-
-local animSec = miscTab:Section("Spin", "Right")
-local AnimSpooferEnabled = false
-
-local ANIM_PLATFORMSTAND_OFFSET = 0x1E8
-local ANIM_ANIMATION_ID_OFFSET = 0xD0
-
-task.spawn(function()
-    local success, response = pcall(function() return game:HttpGet("https://imtheo.lol/Offsets/Offsets.json") end)
-    if success and response then
-        local ok, parsed = pcall(function() return game:GetService("HttpService"):JSONDecode(response) end)
-        if ok and type(parsed) == "table" then
-            local function deepSearch(tbl, targetString)
-                targetString = targetString:lower()
-                for key, val in pairs(tbl) do
-                    if type(key) == "string" and string.find(key:lower(), targetString, 1, true) then
-                        if type(val) == "number" then return val end
-                        if type(val) == "string" then return tonumber(val) or tonumber(val, 16) end
-                    elseif type(val) == "table" then
-                        local found = deepSearch(val, targetString)
-                        if found then return found end
-                    end
-                end
-                return nil
-            end
-            local dynamicPS = deepSearch(parsed, "platformstand")
-            local dynamicAnim = deepSearch(parsed, "animationid")
-            if dynamicPS then ANIM_PLATFORMSTAND_OFFSET = dynamicPS end
-            if dynamicAnim then ANIM_ANIMATION_ID_OFFSET = dynamicAnim end
-        end
-    end
-end)
-
-local function read_std_string(addr)
-    local size = memory_read("uintptr_t", addr + 0x10)
-    local cap = memory_read("uintptr_t", addr + 0x18)
-    if size == 0 then return "" end
-    local ptr = (cap >= 16) and memory_read("uintptr_t", addr) or addr
-    local bytes = {}
-    for i = 0, size - 1 do bytes[i + 1] = string.char(memory_read("byte", ptr + i)) end
-    return table.concat(bytes)
-end
-
-local function write_std_string(addr, newStr)
-    local cap = memory_read("uintptr_t", addr + 0x18)
-    if #newStr > cap then return false end
-    local ptr = (cap >= 16) and memory_read("uintptr_t", addr) or addr
-    for i = 1, #newStr do memory_write("byte", ptr + i - 1, string.byte(newStr, i)) end
-    memory_write("byte", ptr + #newStr, 0)
-    memory_write("uintptr_t", addr + 0x10, #newStr)
-    return true
-end
-
-local function inflate_capacity_if_needed(animObj, targetStr)
-    local addr = animObj.Address + ANIM_ANIMATION_ID_OFFSET
-    local cap = memory_read("uintptr_t", addr + 0x18)
-    if cap >= #targetStr then return true end
-    if setscriptable then pcall(setscriptable, animObj, "AnimationId", true) end
-    local ok = pcall(function() animObj.AnimationId = targetStr end)
-    if not ok and sethiddenproperty then pcall(function() sethiddenproperty(animObj, "AnimationId", targetStr) end) end
-    cap = memory_read("uintptr_t", addr + 0x18)
-    if cap >= #targetStr then return true end
-    local strVal = Instance.new("StringValue")
-    strVal.Name = "TempProxy"
-    strVal.Value = targetStr
-    local strAddr = strVal.Address
-    if strAddr then
-        local targetLen = #targetStr
-        local foundOffset = nil
-        for offset = 0x10, 0x150, 8 do
-            local s = memory_read("uintptr_t", strAddr + offset + 0x10)
-            local c = memory_read("uintptr_t", strAddr + offset + 0x18)
-            if s == targetLen and c >= targetLen and c < targetLen + 100 then
-                foundOffset = offset
-                break
-            end
-        end
-        if foundOffset then
-            local theftAddr = strAddr + foundOffset
-            for i = 0, 24, 8 do
-                local temp = memory_read("uintptr_t", addr + i)
-                local newVal = memory_read("uintptr_t", theftAddr + i)
-                memory_write("uintptr_t", addr + i, newVal)
-                memory_write("uintptr_t", theftAddr + i, temp)
-            end
-            return true
-        end
-    end
-    return false
-end
-
-local OriginalAnimations = {}
-local TargetAnimations = {
-    idle = "http://www.roblox.com/asset/?id=138257730945066",
-    walk = "http://www.roblox.com/asset/?id=83198550003129",
-    run = "http://www.roblox.com/asset/?id=130619106001706",
-    jump = "http://www.roblox.com/asset/?id=123329302355957",
-    fall = "http://www.roblox.com/asset/?id=70905428714112",
-    swim = "http://www.roblox.com/asset/?id=90023041430816",
-    climb = "http://www.roblox.com/asset/?id=95386679149396"
-}
-
-local function applyCustomAnimations()
-    local player = game:GetService("Players").LocalPlayer
-    if not player or not player.Character then return end
-    local hum = player.Character:FindFirstChild("Humanoid")
-    local animate = player.Character:FindFirstChild("Animate")
-    if not hum or not animate or not hum.Address then return end
-    
-    pcall(function() memory_write("byte", hum.Address + ANIM_PLATFORMSTAND_OFFSET, 1) end)
-    task.wait(0.1)
-    
-    for folderName, targetIdStr in pairs(TargetAnimations) do
-        local folder = animate:FindFirstChild(folderName)
-        if folder then
-            local anims = {}
-            for _, child in ipairs(folder:GetChildren()) do
-                if child:IsA("Animation") then table.insert(anims, child) end
-            end
-            
-            if not OriginalAnimations[folderName] then
-                OriginalAnimations[folderName] = {}
-                for i, animObj in ipairs(anims) do
-                    local addr = animObj.Address + ANIM_ANIMATION_ID_OFFSET
-                    OriginalAnimations[folderName][i] = read_std_string(addr)
-                end
-            end
-            
-            for i, animObj in ipairs(anims) do
-                local toApply = AnimSpooferEnabled and targetIdStr or (OriginalAnimations[folderName][i] or "")
-                if toApply ~= "" then
-                    local addr = animObj.Address + ANIM_ANIMATION_ID_OFFSET
-                    if read_std_string(addr) ~= toApply then
-                        inflate_capacity_if_needed(animObj, toApply)
-                        write_std_string(addr, toApply)
-                    end
-                end
-            end
-        end
-    end
-    
-    task.wait(0.1)
-    pcall(function() memory_write("byte", hum.Address + ANIM_PLATFORMSTAND_OFFSET, 0) end)
-end
-
-task.spawn(function()
-    local lastCharAddr = nil
-    while true do
-        task.wait(0.5)
-        local player = game:GetService("Players").LocalPlayer
-        if player and player.Character then
-            local hum = player.Character:FindFirstChild("Humanoid")
-            if hum and hum.Address then
-                if lastCharAddr ~= hum.Address then
-                    lastCharAddr = hum.Address
-                    task.wait(0.5)
-                    OriginalAnimations = {}
-                    if AnimSpooferEnabled then
-                        applyCustomAnimations()
-                    end
-                end
-            end
-        end
-    end
-end)
-
-animSec:Toggle("Enable Spin", false, function(state)
-    AnimSpooferEnabled = state
-    applyCustomAnimations()
-    if state then
-        Lib:Notify("Spin", "Spin enabled!", 3, "success")
-    else
-        Lib:Notify("Spin", "Spin disabled!", 3, "warning")
-    end
-end)
-
 
 local AntiAfkEnabled = false
 local MOVE_KEYS = { 0x57, 0x41, 0x53, 0x44 }
