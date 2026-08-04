@@ -1224,12 +1224,39 @@ end)
 pcall(function()
     local teleportSec = miscTab:Section("Teleport", "Right")
     if not teleportSec then return end
+    local teleportPlayers = game:GetService("Players")
 
     local function getTeleportHRP()
-        local localPlayer = game:GetService("Players").LocalPlayer
+        local localPlayer = teleportPlayers.LocalPlayer
         local character = localPlayer and localPlayer.Character
         if not character then return nil end
         return character:FindFirstChild("HumanoidRootPart")
+    end
+
+    local function hasToolNamed(container, toolName)
+        if not container then return false end
+        for _, item in ipairs(container:GetChildren()) do
+            if item:IsA("Tool") and item.Name == toolName then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function findRoleTargetPlayer(toolName)
+        for _, player in ipairs(teleportPlayers:GetPlayers()) do
+            if player ~= teleportPlayers.LocalPlayer and player.Character then
+                local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
+                local targetRoot = player.Character:FindFirstChild("HumanoidRootPart")
+                if humanoid and humanoid.Health > 0 and targetRoot then
+                    local backpack = player:FindFirstChildOfClass("Backpack")
+                    if hasToolNamed(player.Character, toolName) or hasToolNamed(backpack, toolName) then
+                        return player, targetRoot
+                    end
+                end
+            end
+        end
+        return nil, nil
     end
 
     local function getBoundsInfo(root)
@@ -1275,6 +1302,69 @@ pcall(function()
 
         local center = Vector3.new((minX + maxX) * 0.5, (minY + maxY) * 0.5, (minZ + maxZ) * 0.5)
         return center, maxY
+    end
+
+    local function hasNameFragment(name, fragments)
+        local lowered = string.lower(name or "")
+        for _, fragment in ipairs(fragments) do
+            if string.find(lowered, fragment, 1, true) then
+                return true
+            end
+        end
+        return false
+    end
+
+    local function getSafeMapPosition(mapRoot)
+        if not mapRoot then return nil end
+
+        local mapCenter = nil
+        local mapTopY = nil
+        mapCenter, mapTopY = getBoundsInfo(mapRoot)
+        local minSafeY = mapCenter and (mapCenter.Y - 30) or -math.huge
+        local maxSafeY = mapTopY and (mapTopY - 2) or math.huge
+
+        local bestPart = nil
+        local bestScore = -math.huge
+        local blockedNameFragments = {
+            "barrier",
+            "boundary",
+            "blocker",
+            "invisible",
+            "kill",
+            "death",
+            "lava",
+            "void",
+            "roof",
+            "ceiling"
+        }
+
+        for _, part in ipairs(mapRoot:GetDescendants()) do
+            if part:IsA("BasePart")
+                and part.CanCollide
+                and part.Transparency < 1
+                and part.Size.X >= 4
+                and part.Size.Z >= 4
+                and part.Size.Y >= 0.5
+                and part.Position.Y >= minSafeY
+                and part.Position.Y <= maxSafeY
+                and not hasNameFragment(part.Name, blockedNameFragments) then
+                local areaScore = (part.Size.X * part.Size.Z)
+                local heightPenalty = mapCenter and math.abs(part.Position.Y - mapCenter.Y) or 0
+                local centerPenalty = mapCenter and ((Vector2.new(part.Position.X, part.Position.Z) - Vector2.new(mapCenter.X, mapCenter.Z)).Magnitude) or 0
+                local spawnBonus = hasNameFragment(part.Name, { "spawn", "start" }) and 40 or 0
+                local score = areaScore - (heightPenalty * 2) - (centerPenalty * 0.35) + spawnBonus
+                if score > bestScore then
+                    bestScore = score
+                    bestPart = part
+                end
+            end
+        end
+
+        if not bestPart then
+            return nil
+        end
+
+        return bestPart.Position + Vector3.new(0, (bestPart.Size.Y * 0.5) + 4, 0)
     end
 
     local function getActiveMapRoot()
@@ -1361,6 +1451,36 @@ pcall(function()
         end
 
         hrp.CFrame = CFrame.new(lobbyPos)
+    end)
+
+    teleportSec:Button("Teleport to Murderer", function()
+        local hrp = getTeleportHRP()
+        if not hrp then return end
+
+        local targetPlayer, targetRoot = findRoleTargetPlayer("Knife")
+        if not targetRoot then
+            Lib:Notify("Teleport", "No active murderer found.", 3)
+            return
+        end
+
+        local targetPos = targetRoot.Position - (targetRoot.CFrame.LookVector * 3) + Vector3.new(0, 2, 0)
+        hrp.CFrame = CFrame.new(targetPos, targetRoot.Position)
+        Lib:Notify("Teleport", "Teleported to murderer: " .. targetPlayer.Name, 3)
+    end)
+
+    teleportSec:Button("Teleport to Sheriff", function()
+        local hrp = getTeleportHRP()
+        if not hrp then return end
+
+        local targetPlayer, targetRoot = findRoleTargetPlayer("Gun")
+        if not targetRoot then
+            Lib:Notify("Teleport", "No active sheriff found.", 3)
+            return
+        end
+
+        local targetPos = targetRoot.Position - (targetRoot.CFrame.LookVector * 3) + Vector3.new(0, 2, 0)
+        hrp.CFrame = CFrame.new(targetPos, targetRoot.Position)
+        Lib:Notify("Teleport", "Teleported to sheriff: " .. targetPlayer.Name, 3)
     end)
 
     teleportSec:Button("Teleport Above Map", function()
