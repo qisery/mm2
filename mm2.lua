@@ -1,7 +1,7 @@
 local HttpService = game:GetService("HttpService")
 local API_URL = "https://mm2-api.onrender.com/api/all"
 
-local Lib = loadstring(game:HttpGet("https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/main/uilib.min.lua"))() or INSui
+local Lib = loadstring(game:HttpGet("https://raw.githubusercontent.com/qisery/mm2/main/ui.lua"))()
 
 
 
