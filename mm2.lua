@@ -1221,6 +1221,174 @@ task.spawn(function()
     end
 end)
 
+pcall(function()
+    local teleportSec = miscTab:Section("Teleport", "Right")
+    if not teleportSec then return end
+
+    local function getTeleportHRP()
+        local localPlayer = game:GetService("Players").LocalPlayer
+        local character = localPlayer and localPlayer.Character
+        if not character then return nil end
+        return character:FindFirstChild("HumanoidRootPart")
+    end
+
+    local function getBoundsInfo(root)
+        if not root then return nil, nil end
+
+        if root:IsA("BasePart") then
+            local p = root.Position
+            return p, p.Y + (root.Size.Y * 0.5)
+        end
+
+        if root:IsA("Model") then
+            local ok, cf, size = pcall(function()
+                return root:GetBoundingBox()
+            end)
+            if ok and cf and size then
+                local center = cf.Position
+                return center, center.Y + (size.Y * 0.5)
+            end
+        end
+
+        local minX, minY, minZ = math.huge, math.huge, math.huge
+        local maxX, maxY, maxZ = -math.huge, -math.huge, -math.huge
+        local found = false
+
+        for _, part in ipairs(root:GetDescendants()) do
+            if part:IsA("BasePart") then
+                found = true
+                local half = part.Size * 0.5
+                local low = part.Position - half
+                local high = part.Position + half
+                if low.X < minX then minX = low.X end
+                if low.Y < minY then minY = low.Y end
+                if low.Z < minZ then minZ = low.Z end
+                if high.X > maxX then maxX = high.X end
+                if high.Y > maxY then maxY = high.Y end
+                if high.Z > maxZ then maxZ = high.Z end
+            end
+        end
+
+        if not found then
+            return nil, nil
+        end
+
+        local center = Vector3.new((minX + maxX) * 0.5, (minY + maxY) * 0.5, (minZ + maxZ) * 0.5)
+        return center, maxY
+    end
+
+    local function getActiveMapRoot()
+        local normal = workspace:FindFirstChild("Normal")
+        if normal then
+            for _, map in ipairs(normal:GetChildren()) do
+                if (map:IsA("Model") or map:IsA("Folder")) and map:FindFirstChildWhichIsA("BasePart", true) then
+                    return map
+                end
+            end
+            if normal:FindFirstChildWhichIsA("BasePart", true) then
+                return normal
+            end
+        end
+
+        for _, obj in ipairs(workspace:GetChildren()) do
+            if obj:FindFirstChild("CoinContainer", true) then
+                return obj
+            end
+        end
+
+        return nil
+    end
+
+    local function getActiveMapPart()
+        local mapRoot = getActiveMapRoot()
+        if not mapRoot then return nil end
+        if mapRoot:IsA("BasePart") then return mapRoot end
+        return mapRoot:FindFirstChildWhichIsA("BasePart", true)
+    end
+
+    local function getLobbyRoot()
+        local lobby = workspace:FindFirstChild("Lobby")
+        if lobby then
+            return lobby
+        end
+        for _, obj in ipairs(workspace:GetChildren()) do
+            if string.find(string.lower(obj.Name), "lobby") then
+                return obj
+            end
+        end
+        return nil
+    end
+
+    local function getLobbyFountainPosition()
+        local lobby = getLobbyRoot()
+        if not lobby then return nil end
+
+        local fountainRoot = nil
+        if string.find(string.lower(lobby.Name), "fountain") then
+            fountainRoot = lobby
+        else
+            for _, obj in ipairs(lobby:GetDescendants()) do
+                if string.find(string.lower(obj.Name), "fountain") then
+                    fountainRoot = obj
+                    break
+                end
+            end
+        end
+
+        if fountainRoot then
+            local center, topY = getBoundsInfo(fountainRoot)
+            if center and topY then
+                return Vector3.new(center.X, topY + 20, center.Z)
+            end
+        end
+
+        local fallbackPart = lobby:IsA("BasePart") and lobby or lobby:FindFirstChildWhichIsA("BasePart", true)
+        if fallbackPart then
+            return fallbackPart.Position + Vector3.new(0, 8, 0)
+        end
+
+        return nil
+    end
+
+    teleportSec:Button("Teleport to Lobby", function()
+        local hrp = getTeleportHRP()
+        if not hrp then return end
+
+        local lobbyPos = getLobbyFountainPosition()
+        if not lobbyPos then
+            Lib:Notify("Teleport", "Lobby not found.", 3)
+            return
+        end
+
+        hrp.CFrame = CFrame.new(lobbyPos)
+    end)
+
+    teleportSec:Button("Teleport Above Map", function()
+        local hrp = getTeleportHRP()
+        if not hrp then return end
+
+        local mapRoot = getActiveMapRoot()
+        if not mapRoot then
+            Lib:Notify("Teleport", "No active map found.", 3)
+            return
+        end
+
+        local center, topY = getBoundsInfo(mapRoot)
+        if center and topY then
+            hrp.CFrame = CFrame.new(center.X, topY + 60, center.Z)
+            return
+        end
+
+        local mapPart = getActiveMapPart()
+        if not mapPart then
+            Lib:Notify("Teleport", "No active map found.", 3)
+            return
+        end
+
+        hrp.CFrame = CFrame.new(mapPart.Position + Vector3.new(0, 60, 0))
+    end)
+end)
+
 
 
 local miscSec = visualsTab:Section("Gun & Trap ESP", "Left")
