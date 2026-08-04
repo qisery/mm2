@@ -1,13 +1,509 @@
 local HttpService = game:GetService("HttpService")
 local API_URL = "https://mm2-api.onrender.com/api/all"
 
-local Lib = loadstring(game:HttpGet("https://raw.githubusercontent.com/neaxusxgod-png/INS-ui/main/uilib.min.lua"))() or INSui
-
-
-
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local GuiService = game:GetService("GuiService")
+
+local OBSIDIAN_REPO = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
+
+local function safeLoad(url)
+    local ok, loaded = pcall(function()
+        return loadstring(game:HttpGet(url))()
+    end)
+    if ok then
+        return loaded
+    end
+    return nil
+end
+
+local ObsidianLib = safeLoad(OBSIDIAN_REPO .. "Library.lua")
+if not ObsidianLib then
+    warn("Failed to load Obsidian UI Library")
+    return
+end
+
+local ThemeManager = safeLoad(OBSIDIAN_REPO .. "addons/ThemeManager.lua")
+local SaveManager = safeLoad(OBSIDIAN_REPO .. "addons/SaveManager.lua")
+
+local function toKeyCode(key)
+    if typeof(key) == "EnumItem" then
+        return key
+    end
+    if type(key) ~= "string" then
+        return Enum.KeyCode.RightControl
+    end
+    local normalized = key:gsub("%s+", "")
+    return Enum.KeyCode[normalized] or Enum.KeyCode.RightControl
+end
+
+local function createLegacyUiAdapter(baseLib, themeManager, saveManager)
+    local uiIdCounter = 0
+    local pendingTheme = nil
+    local pendingCornerRadius = nil
+
+    local function nextId(prefix, text)
+        uiIdCounter = uiIdCounter + 1
+        local cleaned = tostring(text or "element"):lower():gsub("[^%w]+", "_"):gsub("^_+", ""):gsub("_+$", "")
+        if cleaned == "" then
+            cleaned = "element"
+        end
+        return string.format("%s_%s_%d", prefix, cleaned, uiIdCounter)
+    end
+
+    local function toSelectedMap(value)
+        if type(value) == "table" then
+            if #value > 0 then
+                local selected = {}
+                for _, item in ipairs(value) do
+                    selected[item] = true
+                end
+                return selected
+            end
+            return value
+        end
+
+        if type(value) == "string" and value ~= "" then
+            return { [value] = true }
+        end
+
+        return {}
+    end
+
+    local function toSelectedList(value, values)
+        if type(value) == "string" then
+            return { value }
+        end
+
+        if type(value) ~= "table" then
+            return {}
+        end
+
+        if #value > 0 then
+            local out = {}
+            for _, item in ipairs(value) do
+                table.insert(out, item)
+            end
+            return out
+        end
+
+        local out = {}
+        local seen = {}
+        if type(values) == "table" then
+            for _, candidate in ipairs(values) do
+                if value[candidate] then
+                    table.insert(out, candidate)
+                    seen[candidate] = true
+                end
+            end
+        end
+
+        for key, state in pairs(value) do
+            if type(key) == "string" and state == true and not seen[key] then
+                table.insert(out, key)
+                seen[key] = true
+            elseif type(state) == "string" and not seen[state] then
+                table.insert(out, state)
+                seen[state] = true
+            end
+        end
+        return out
+    end
+
+    local function normalizeSingle(value, values)
+        if type(value) == "number" and type(values) == "table" then
+            return values[value]
+        end
+
+        if type(value) ~= "table" then
+            return value
+        end
+
+        if #value > 0 then
+            return value[1]
+        end
+
+        if type(values) == "table" then
+            for _, candidate in ipairs(values) do
+                if value[candidate] then
+                    return candidate
+                end
+            end
+        end
+
+        for key, state in pairs(value) do
+            if type(key) == "string" and state == true then
+                return key
+            elseif type(state) == "string" then
+                return state
+            end
+        end
+        return nil
+    end
+
+    local function createSectionWrapper(groupbox)
+        local section = {}
+
+        function section:Label(text)
+            local label = groupbox:AddLabel(tostring(text or ""))
+            local state = {
+                text = tostring(text or ""),
+                color = nil
+            }
+
+            local wrapped = {}
+
+            local function refreshLabel()
+                if state.color then
+                    local r = math.floor((state.color.R * 255) + 0.5)
+                    local g = math.floor((state.color.G * 255) + 0.5)
+                    local b = math.floor((state.color.B * 255) + 0.5)
+                    label:SetText(string.format('<font color="rgb(%d,%d,%d)">%s</font>', r, g, b, state.text))
+                else
+                    label:SetText(state.text)
+                end
+            end
+
+            function wrapped:SetText(newText)
+                state.text = tostring(newText or "")
+                refreshLabel()
+            end
+
+            function wrapped:SetColor(newColor)
+                state.color = newColor
+                refreshLabel()
+            end
+
+            return wrapped
+        end
+
+        function section:Button(text, callback)
+            return groupbox:AddButton(tostring(text or "Button"), function()
+                if callback then
+                    callback()
+                end
+            end)
+        end
+
+        function section:Divider(text)
+            return groupbox:AddDivider(text)
+        end
+
+        function section:Toggle(text, defaultValue, callback)
+            local toggle = groupbox:AddToggle(nextId("toggle", text), {
+                Text = tostring(text or "Toggle"),
+                Default = defaultValue == true,
+                Callback = function(state)
+                    if callback then
+                        callback(state)
+                    end
+                end
+            })
+
+            local wrapped = {}
+
+            function wrapped:AddKeybind(key, mode, bindCallback)
+                local keyName = type(key) == "string" and key:upper() or "NONE"
+                return toggle:AddKeyPicker(nextId("keybind", text), {
+                    Default = keyName,
+                    Mode = mode or "Hold",
+                    Text = tostring(text or "Keybind"),
+                    SyncToggleState = false,
+                    Callback = function(active)
+                        if bindCallback then
+                            bindCallback(active)
+                        end
+                    end
+                })
+            end
+
+            function wrapped:Set(value)
+                toggle:SetValue(value == true)
+            end
+
+            return wrapped
+        end
+
+        function section:Colorpicker(text, defaultColor, callback)
+            local anchor = groupbox:AddLabel(tostring(text or "Color"))
+            return anchor:AddColorPicker(nextId("color", text), {
+                Title = tostring(text or "Color"),
+                Default = defaultColor or Color3.fromRGB(255, 255, 255),
+                Callback = function(color)
+                    if callback then
+                        callback(color)
+                    end
+                end
+            })
+        end
+
+        function section:Slider(text, defaultValue, _rounding, minValue, maxValue, suffix, callback)
+            return groupbox:AddSlider(nextId("slider", text), {
+                Text = tostring(text or "Slider"),
+                Default = tonumber(defaultValue) or 0,
+                Min = tonumber(minValue) or 0,
+                Max = tonumber(maxValue) or 100,
+                Rounding = 0,
+                Suffix = tostring(suffix or ""),
+                Callback = function(value)
+                    if callback then
+                        callback(value)
+                    end
+                end
+            })
+        end
+
+        function section:Textbox(text, defaultValue, callback)
+            return groupbox:AddInput(nextId("input", text), {
+                Text = tostring(text or "Input"),
+                Default = tostring(defaultValue or ""),
+                Callback = function(value)
+                    if callback then
+                        callback(value)
+                    end
+                end
+            })
+        end
+
+        function section:Dropdown(text, defaultValue, values, multi, callback, tooltip, searchable)
+            local dropdownValues = type(values) == "table" and values or {}
+            local isMulti = multi == true
+
+            local defaultSelection = defaultValue
+            if isMulti then
+                defaultSelection = toSelectedMap(defaultValue)
+            elseif defaultSelection == "nil" then
+                defaultSelection = nil
+            elseif type(defaultSelection) == "table" then
+                defaultSelection = defaultSelection[1]
+            end
+
+            local dropdown = groupbox:AddDropdown(nextId("dropdown", text), {
+                Text = tostring(text or "Dropdown"),
+                Values = dropdownValues,
+                Default = defaultSelection,
+                Multi = isMulti,
+                AllowNull = true,
+                Tooltip = tooltip,
+                Searchable = searchable == true,
+                Callback = function(value)
+                    if callback then
+                        if isMulti then
+                            callback(toSelectedList(value, dropdownValues))
+                        else
+                            callback(normalizeSingle(value, dropdownValues))
+                        end
+                    end
+                end
+            })
+
+            local wrapped = {
+                _dropdown = dropdown,
+                _values = dropdownValues,
+                _multi = isMulti
+            }
+
+            function wrapped:Get()
+                local current = wrapped._dropdown.Value
+                if wrapped._multi then
+                    return toSelectedList(current, wrapped._values)
+                end
+                return normalizeSingle(current, wrapped._values)
+            end
+
+            function wrapped:Set(value)
+                if wrapped._multi then
+                    wrapped._dropdown:SetValue(toSelectedMap(value))
+                    return
+                end
+
+                if type(value) == "table" then
+                    wrapped._dropdown:SetValue(value[1])
+                else
+                    wrapped._dropdown:SetValue(value)
+                end
+            end
+
+            function wrapped:UpdateChoices(newValues)
+                wrapped._values = type(newValues) == "table" and newValues or {}
+                wrapped._dropdown:SetValues(wrapped._values)
+            end
+
+            function wrapped:AddChoice(choice)
+                table.insert(wrapped._values, choice)
+                wrapped._dropdown:AddValues(choice)
+            end
+
+            function wrapped:RemoveChoice(choice)
+                for i = #wrapped._values, 1, -1 do
+                    if wrapped._values[i] == choice then
+                        table.remove(wrapped._values, i)
+                    end
+                end
+
+                wrapped._dropdown:SetValues(wrapped._values)
+
+                if wrapped._multi then
+                    local selected = wrapped:Get()
+                    for i = #selected, 1, -1 do
+                        if selected[i] == choice then
+                            table.remove(selected, i)
+                        end
+                    end
+                    wrapped:Set(selected)
+                elseif wrapped:Get() == choice then
+                    wrapped._dropdown:SetValue(nil)
+                end
+            end
+
+            return wrapped
+        end
+
+        return section
+    end
+
+    local function createTabWrapper(tab)
+        local wrappedTab = {}
+
+        function wrappedTab:Section(name, side)
+            local title = tostring(name or "Section")
+            local placement = tostring(side or "Left")
+            local groupbox
+
+            if placement == "Right" then
+                groupbox = tab:AddRightGroupbox(title)
+            else
+                groupbox = tab:AddLeftGroupbox(title)
+            end
+
+            return createSectionWrapper(groupbox)
+        end
+
+        return wrappedTab
+    end
+
+    local function configureSettingsTab(window, icon)
+        local settingsTab = window:AddTab("UI Settings", icon or "settings")
+
+        if themeManager then
+            pcall(function()
+                themeManager:SetLibrary(baseLib)
+                themeManager:SetFolder("LeatherHubMM2")
+                themeManager:ApplyToTab(settingsTab, "palette")
+                themeManager:LoadDefault()
+            end)
+        end
+
+        if saveManager then
+            pcall(function()
+                saveManager:SetLibrary(baseLib)
+                saveManager:IgnoreThemeSettings()
+                saveManager:SetFolder("LeatherHubMM2")
+                saveManager:BuildConfigSection(settingsTab, "save")
+                saveManager:LoadAutoloadConfig()
+            end)
+        end
+
+        return createTabWrapper(settingsTab)
+    end
+
+    local adapter = {}
+
+    function adapter:ApplyThemePreset(theme)
+        pendingTheme = theme
+    end
+
+    function adapter:SetBackgroundEffect(_effect)
+    end
+
+    function adapter:SetRounding(rounding)
+        pendingCornerRadius = tonumber(rounding) or pendingCornerRadius
+    end
+
+    function adapter:SetRowLines(_enabled)
+    end
+
+    function adapter:CreateWindow(options)
+        local windowOptions = options or {}
+        local size = windowOptions.size
+        local mappedSize = nil
+
+        if typeof(size) == "Vector2" then
+            mappedSize = UDim2.fromOffset(size.X, size.Y)
+        elseif typeof(size) == "UDim2" then
+            mappedSize = size
+        end
+
+        local logo = windowOptions.logo or windowOptions.Icon
+        local icon = logo
+        if type(icon) == "string" and icon:match("^https?://") then
+            icon = nil
+        end
+
+        local window = baseLib:CreateWindow({
+            Title = windowOptions.title or windowOptions.Title or "LeatherHub MM2",
+            Footer = windowOptions.subtitle or windowOptions.Footer or "",
+            Icon = icon,
+            Size = mappedSize,
+            CornerRadius = pendingCornerRadius or windowOptions.CornerRadius,
+            ToggleKeybind = toKeyCode(windowOptions.menuKey or windowOptions.ToggleKeybind),
+            NotifySide = "Right"
+        })
+
+        if type(logo) == "string" and logo:match("^https?://") then
+            pcall(function()
+                window:SetBackgroundImage(logo)
+            end)
+        end
+
+        if pendingTheme and themeManager then
+            pcall(function()
+                themeManager:SetLibrary(baseLib)
+                themeManager:ApplyTheme(pendingTheme)
+            end)
+        end
+
+        local wrappedWindow = {}
+
+        function wrappedWindow:Tab(name, iconName)
+            return createTabWrapper(window:AddTab(tostring(name or "Tab"), iconName))
+        end
+
+        function wrappedWindow:AddSettingsTab(iconName)
+            return configureSettingsTab(window, iconName or "settings")
+        end
+
+        return wrappedWindow
+    end
+
+    function adapter:Notify(title, description, duration, kind)
+        local iconByKind = {
+            success = "check",
+            error = "triangle-alert",
+            warning = "alert-triangle",
+            info = "info"
+        }
+
+        if description == nil then
+            baseLib:Notify(tostring(title or ""), tonumber(duration) or 4)
+            return
+        end
+
+        baseLib:Notify({
+            Title = tostring(title or "Notice"),
+            Description = tostring(description or ""),
+            Time = tonumber(duration) or 4,
+            Icon = iconByKind[kind]
+        })
+    end
+
+    return adapter
+end
+
+local Lib = createLegacyUiAdapter(ObsidianLib, ThemeManager, SaveManager)
+local function notify(text, title, duration)
+    Lib:Notify(title or "Notification", text or "", duration or 3)
+end
 
 local function getMouse()
     local ok, pos = pcall(function()
@@ -21,12 +517,7 @@ local function getMouse()
 
     return { X = 0, Y = 0 }
 end
-if not Lib then
-    warn("Failed to load INS-ui")
-    return
-end
 
-local Players = game:GetService("Players")
 local LocalPlayer = Players.LocalPlayer
 
 local RoundTimerEnabled = false
@@ -53,7 +544,7 @@ Lib:SetRowLines(true)
 
 local win = Lib:CreateWindow({
     title = "LeatherHub MM2",
-    subtitle = "Search: Ctrl+Space",
+    subtitle = "Discord.gg/kQs7zvTwnX",
     logo = "https://raw.githubusercontent.com/qisery/mm2/main/moto1.jpg",
     logoSize = 32,
     size = Vector2 and Vector2.new(950, 650) or nil,
@@ -2393,7 +2884,7 @@ task.spawn(function()
                                     
                                     if type(notify) == "function" and #pool > 0 then
                                         if HitSoundIndex > #pool then HitSoundIndex = 1 end
-                                        notify(pool[HitSoundIndex], "Matcha", 4)
+                                        notify(pool[HitSoundIndex], "LeatherHub", 4)
                                         HitSoundIndex = HitSoundIndex + 1
                                     end
                                 end
@@ -2505,7 +2996,7 @@ soundSec:Button("Add Custom Text", function()
             customSoundsCombo:AddChoice(hitSoundInput)
         end
         if type(notify) == "function" then
-            notify("Added: " .. hitSoundInput, "Matcha", 4)
+            notify("Added: " .. hitSoundInput, "LeatherHub", 4)
         end
     end
 end)
@@ -2540,7 +3031,7 @@ soundSec:Button("Remove Selected Custom", function()
             customSoundsCombo:AddChoice("(None)")
         end
         if #toRemove > 0 and type(notify) == "function" then
-            notify("Removed " .. #toRemove .. " sounds", "Matcha", 4)
+            notify("Removed " .. #toRemove .. " sounds", "LeatherHub", 4)
         end
     end
 end)
@@ -2571,7 +3062,7 @@ soundSec:Button("Test Hit Sound", function()
     
     if type(notify) == "function" and #pool > 0 then
         if HitSoundIndex > #pool then HitSoundIndex = 1 end
-        notify(pool[HitSoundIndex], "Matcha", 4)
+        notify(pool[HitSoundIndex], "LeatherHub", 4)
         HitSoundIndex = HitSoundIndex + 1
     end
 end)
