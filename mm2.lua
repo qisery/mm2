@@ -1,3 +1,14 @@
+--================================================================--
+--                                                                --
+--                LeatherHub | Murder Mystery 2                   --
+--                  UI: Obsidian UI Library                       --
+--                                                                --
+--================================================================--
+
+--================================================================--
+--                    SERVICES & CONSTANTS                        --
+--================================================================--
+
 local HttpService = game:GetService("HttpService")
 local API_URL = "https://mm2-api.onrender.com/api/all"
 
@@ -6,6 +17,10 @@ local UserInputService = game:GetService("UserInputService")
 local GuiService = game:GetService("GuiService")
 
 local OBSIDIAN_REPO = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
+
+--================================================================--
+--                  OBSIDIAN LIBRARY LOADING                      --
+--================================================================--
 
 local function safeLoad(url)
     local ok, loaded = pcall(function()
@@ -26,6 +41,10 @@ end
 local ThemeManager = safeLoad(OBSIDIAN_REPO .. "addons/ThemeManager.lua")
 local SaveManager = safeLoad(OBSIDIAN_REPO .. "addons/SaveManager.lua")
 
+--================================================================--
+--                       SMALL HELPERS                            --
+--================================================================--
+
 local function toKeyCode(key)
     if typeof(key) == "EnumItem" then
         return key
@@ -36,6 +55,11 @@ local function toKeyCode(key)
     local normalized = key:gsub("%s+", "")
     return Enum.KeyCode[normalized] or Enum.KeyCode.RightControl
 end
+
+--================================================================--
+--            LEGACY UI ADAPTER (Obsidian wrapper)                --
+--   Bridges the old section/tab API onto Obsidian's groupboxes   --
+--================================================================--
 
 local function createLegacyUiAdapter(baseLib, themeManager, saveManager)
     local uiIdCounter = 0
@@ -434,10 +458,27 @@ local function createLegacyUiAdapter(baseLib, themeManager, saveManager)
             mappedSize = size
         end
 
+        -- Obsidian's Icon option accepts Lucide icon names or Roblox
+        -- asset ids, but not raw http(s) URLs. Remote logos are
+        -- downloaded and converted into a local custom asset so the
+        -- image renders next to the window title.
         local logo = windowOptions.logo or windowOptions.Icon
         local icon = logo
         if type(icon) == "string" and icon:match("^https?://") then
             icon = nil
+            if writefile and getcustomasset then
+                local ok, asset = pcall(function()
+                    local extension = logo:match("%.(%w+)$") or "png"
+                    local fileName = "LeatherHubMM2_Logo." .. extension
+                    if not (isfile and isfile(fileName)) then
+                        writefile(fileName, game:HttpGet(logo))
+                    end
+                    return getcustomasset(fileName)
+                end)
+                if ok and asset then
+                    icon = asset
+                end
+            end
         end
 
         local window = baseLib:CreateWindow({
@@ -449,12 +490,6 @@ local function createLegacyUiAdapter(baseLib, themeManager, saveManager)
             ToggleKeybind = toKeyCode(windowOptions.menuKey or windowOptions.ToggleKeybind),
             NotifySide = "Right"
         })
-
-        if type(logo) == "string" and logo:match("^https?://") then
-            pcall(function()
-                window:SetBackgroundImage(logo)
-            end)
-        end
 
         if pendingTheme and themeManager then
             pcall(function()
@@ -500,6 +535,10 @@ local function createLegacyUiAdapter(baseLib, themeManager, saveManager)
     return adapter
 end
 
+--================================================================--
+--                   LIBRARY INSTANCE & UTILS                     --
+--================================================================--
+
 local Lib = createLegacyUiAdapter(ObsidianLib, ThemeManager, SaveManager)
 local function notify(text, title, duration)
     Lib:Notify(title or "Notification", text or "", duration or 3)
@@ -520,6 +559,10 @@ end
 
 local LocalPlayer = Players.LocalPlayer
 
+--================================================================--
+--                  ROUND TIMER (Drawing setup)                   --
+--================================================================--
+
 local RoundTimerEnabled = false
 local TimerLabel = Drawing.new("Text")
 TimerLabel.Visible = false
@@ -537,6 +580,10 @@ pcall(function()
     end
 end)
 
+--================================================================--
+--                       WINDOW CREATION                          --
+--================================================================--
+
 Lib:ApplyThemePreset("Default")
 Lib:SetRounding(0)
 Lib:SetRowLines(true)
@@ -551,6 +598,10 @@ local win = Lib:CreateWindow({
     autoSave = false,
     smartFps = false
 })
+
+--================================================================--
+--               ITEM VALUES API (fetch & index)                  --
+--================================================================--
 
 Lib:Notify("Loading...", "Fetching values from server, please wait.", 3)
 
@@ -614,7 +665,9 @@ local function addItemToSection(section, item)
     end)
 end
 
-
+--================================================================--
+--                    TAB: TRADE CHECKER                          --
+--================================================================--
 
 local tradeTab = win:Tab("Trade Checker", "swords")
 
@@ -1016,7 +1069,9 @@ resSec:Button("Clear All Tables", function()
     updateResult()
 end)
 
-
+--================================================================--
+--                     TAB: ITEM VALUES                           --
+--================================================================--
 
 local valuesTab = win:Tab("Item Values", "search")
 local valuesSec = valuesTab:Section("Browse Values", "Full")
@@ -1055,12 +1110,17 @@ for _, group in ipairs(categoryGroups) do
     end
 end
 
-
-
+--================================================================--
+--             TABS: COMBAT / VISUALS / MISC (setup)              --
+--================================================================--
 
 local combatTab = win:Tab("Combat", "swords")
 local visualsTab = win:Tab("Visuals", "eye")
 local miscTab = win:Tab("Misc", "shield")
+
+--================================================================--
+--                  VISUALS: UI & TIMERS                          --
+--================================================================--
 
 local uiSec = visualsTab:Section("UI & Timers", "Left")
 uiSec:Toggle("Show Round Timer", false, function(state)
@@ -1071,6 +1131,10 @@ end)
 uiSec:Colorpicker("Timer Color", Color3.fromRGB(255, 215, 0), function(color)
     TimerLabel.Color = color
 end)
+
+--================================================================--
+--          MISC: PROTECTION (Anti-Fling / Anti-AFK)              --
+--================================================================--
 
 local protectionSec = miscTab:Section("Protection", "Left")
 local steppedConnection = nil
@@ -1160,6 +1224,10 @@ task.spawn(function()
     end
 end)
 
+--================================================================--
+--                    MISC: ROLE NOTIFIER                         --
+--================================================================--
+
 local roleSec = miscTab:Section("Role Notifier", "Left")
 
 local RoleNotifierEnabled = false
@@ -1220,6 +1288,10 @@ task.spawn(function()
         task.wait(1)
     end
 end)
+
+--================================================================--
+--                      MISC: TELEPORTS                           --
+--================================================================--
 
 pcall(function()
     local teleportSec = miscTab:Section("Teleport", "Right")
@@ -1509,7 +1581,9 @@ pcall(function()
     end)
 end)
 
-
+--================================================================--
+--            VISUALS: GUN & TRAP ESP / ROLE ESP                  --
+--================================================================--
 
 local miscSec = visualsTab:Section("Gun & Trap ESP", "Left")
 
@@ -2011,8 +2085,9 @@ RunService.RenderStepped:Connect(function()
     end
 end)
 
-
-
+--================================================================--
+--          COMBAT: AUTO GET GUN / KILL ALL / KNIFE AURA          --
+--================================================================--
 
 local combatSec = combatTab:Section("Combat", "Left")
 
@@ -2337,6 +2412,9 @@ task.spawn(function()
     end
 end)
 
+--================================================================--
+--     VISUALS: HIT TRACERS / KILL EFFECTS / HIT SOUNDS (state)   --
+--================================================================--
 
 local HitTracerEnabled = false
 local HitTracerColor = Color3.fromRGB(0, 255, 100)
@@ -2387,6 +2465,10 @@ local function spawnKE(shape, props)
     end
     table.insert(activeKE, props)
 end
+
+--================================================================--
+--                 KILL EFFECT STYLES (V1 & V2)                   --
+--================================================================--
 
 local kEffectIndex = 0
 local function triggerKillEffect(hitPos, style)
@@ -2749,6 +2831,10 @@ RunService.RenderStepped:Connect(function(dt)
     for i = sIdx, 100 do kePools.Square[i].Visible = false end
 end)
 
+--================================================================--
+--                  HIT TRACER RENDERING                          --
+--================================================================--
+
 local function CustomW2S(p)
     if type(WorldToScreen) == "function" then
         local ok, pos2d, onScreen = pcall(WorldToScreen, p)
@@ -2913,16 +2999,8 @@ local function spawnHitTracerConnectionLine(startPos, endPos, duration, color, t
 
         local s1, on1 = CustomW2S(startPos)
         local s2, on2 = CustomW2S(endPos)
-        
-        if not ok2 or not on2 then
-            line.Visible = false
-            if glowLine then glowLine.Visible = false end
-            return
-        end
-        
 
-        
-        if ok1 and on1 then
+        if on1 and on2 then
             line.From = Vector2.new(s1.X, s1.Y)
             line.To = Vector2.new(s2.X, s2.Y)
             line.Transparency = alpha
@@ -3162,6 +3240,10 @@ task.spawn(function()
     end
 end)
 
+--================================================================--
+--        VISUALS UI: HIT TRACERS / KILL EFFECTS / SOUNDS         --
+--================================================================--
+
 local tracerSec = visualsTab:Section("Hit Tracers", "Right")
 
 tracerSec:Toggle("Enable Hit Tracers", false, function(state)
@@ -3330,6 +3412,9 @@ soundSec:Button("Test Hit Sound", function()
     end
 end)
 
+--================================================================--
+--                   COMBAT: MAGIC KNIFE                          --
+--================================================================--
 
 local knifeSec = combatTab:Section("Magic Knife", "Right")
 
@@ -3502,9 +3587,6 @@ knifeSec:Toggle("Knife Teleport", false, function(state)
     end
 end)
 
-
-
-
 knifeSec:Toggle("Show FOV Circle", true, function(state)
     MagicKnifeFovVisible = state
 end)
@@ -3516,6 +3598,10 @@ end)
 knifeSec:Colorpicker("FOV Circle Color", Color3.fromRGB(255, 255, 255), function(color)
     if fovCircle then fovCircle.Color = color end
 end)
+
+--================================================================--
+--                      TAB: AUTO FARM                            --
+--================================================================--
 
 local farmTab = win:Tab("Auto Farm", "zap")
 local farmSec = farmTab:Section("Coin Farm", "Left")
@@ -3886,6 +3972,10 @@ end)
 farmSec:Slider("Max Coins Limit", 40, 1, 10, 50, "", function(v) FarmConfig.MaxCoins = v end)
 farmSec:Slider("Movement Speed", 25, 1, 1, 30, "", function(v) FarmConfig.TweenSpeed = v end)
 
+--================================================================--
+--             SETTINGS TAB / ROUND TIMER UPDATER                 --
+--================================================================--
+
 win:AddSettingsTab("cog")
 
 game:GetService("RunService").Heartbeat:Connect(function()
@@ -3902,14 +3992,15 @@ game:GetService("RunService").Heartbeat:Connect(function()
                 if surfaceGui then
                     local timerText = surfaceGui:FindFirstChild("Timer")
                     if timerText and timerText.Text then
-                        TimerLabel.Text = "Round Time: " .. timerText.Text
+                        TimerLabel.Text = "Time Left: " .. timerText.Text
                     end
                 end
             else
-                TimerLabel.Text = "Round Time: --:--"
+                TimerLabel.Text = "Time Left: --:--"
             end
         end
     end)
 end)
 
-Lib:Notify("Success!", "Trade Checker, ESP and Gingerscope Skin loaded!", 5, "success")
+Lib:Notify("Success!", "Trade Checker and ESP loaded!", 5, "success")
+
