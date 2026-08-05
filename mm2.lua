@@ -970,7 +970,6 @@ defineModule("values", function(Ctx)
 
     Lib:Notify("Loading...", "Fetching values from server, please wait.", 3)
 
-    -- Remote HTTP: expected to fail sometimes.
     local ok, response = pcall(function()
         return game:HttpGet(API_URL)
     end)
@@ -1117,7 +1116,7 @@ defineModule("trade", function(Ctx)
         return
     end
 
-    local MAX_SLOTS = 4 -- MM2 trades are hard-capped at 4 items per side
+    local MAX_SLOTS = 4 
 
     ----------------------------------------------------------------
     -- Menu labels
@@ -1152,8 +1151,6 @@ defineModule("trade", function(Ctx)
         return
     end
 
-    -- Sync is the item database: Sync.Item == Sync.Weapons, plus Sync.Pets.
-    -- Records look like { ItemName = "Seer", Rarity = "Godly", Chroma = true }.
     local Sync
     do
 
@@ -1163,9 +1160,9 @@ defineModule("trade", function(Ctx)
         Sync = ok and module or nil
     end
 
-    local liveMode = true       -- toggle
-    local tradeOpen = false     -- tradeGui.Enabled
-    local haveEvent = false     -- an UpdateTrade payload arrived for this trade
+    local liveMode = true      
+    local tradeOpen = false     
+    local haveEvent = false     
     local livePartner = ""
 
     local liveYour = { items = {}, total = 0, unpriced = 0 }
@@ -2188,8 +2185,6 @@ defineModule("misc", function(Ctx)
             return
         end
         lastAntiAfkTap = os.clock()
-        -- tapKey holds the key for a moment, so it must not run on the
-        -- dispatcher thread.
         task.spawn(Util.tapKey, ANTI_AFK_KEYS[math.random(1, #ANTI_AFK_KEYS)])
     end)
 
@@ -2902,7 +2897,6 @@ defineModule("combat", function(Ctx)
             return
         end
 
-        -- grabGun yields for a frame, so it runs off the dispatcher.
         nextGunGrab = os.clock() + GUN_GRAB_COOLDOWN
         task.spawn(grabGun, true)
     end)
@@ -3244,8 +3238,6 @@ defineModule("vfx", function(Ctx)
         props.life = 0
         props.maxLife = props.maxLife or 1
 
-        -- Rings read as one flash, so only the debris is stretched by the
-        -- duration slider.
         if shape ~= "Circle" then
             props.maxLife = props.maxLife * state.killEffectDuration
         end
@@ -3432,20 +3424,17 @@ defineModule("vfx", function(Ctx)
         spawnParticle("Circle", { pos = pos, r = 0, maxR = 600, maxLife = 1.2, color = Palette.WHITE, color2 = Palette.GOLD, t = 30, shrink = true })
         spawnParticle("Circle", { pos = pos, r = 200, maxR = 0, maxLife = 0.8, color = Palette.HOLY_WARM, t = 15 })
 
-        -- Ground impact shockwave
         for _ = 1, 100 do
             spawnParticle("Line", { pos = pos, vel = Vector3.new(random(-600, 600), 0, random(-600, 600)),
                 length = random(40, 120), maxLife = 0.6, color = Palette.WHITE, color2 = Palette.GOLD, t = 6 })
         end
 
-        -- Celestial ascension
         for _ = 1, 80 do
             spawnParticle("Square", { pos = pos + Vector3.new(random(-100, 100), random(0, 50), random(-100, 100)),
                 vel = Vector3.new(0, random(200, 500), 0), size = random(20, 50), maxLife = 1.2,
                 color = Shade.holyGold(), color2 = Palette.WHITE, flicker = true })
         end
 
-        -- Divine spears from above
         for _ = 1, 60 do
             spawnParticle("Line", { pos = pos + Vector3.new(random(-150, 150), random(300, 800), random(-150, 150)),
                 vel = Vector3.new(0, -1500, 0), length = random(150, 300), maxLife = 0.5, color = Palette.WHITE,
