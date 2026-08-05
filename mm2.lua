@@ -590,7 +590,7 @@ Lib:SetRowLines(true)
 
 local win = Lib:CreateWindow({
     title = "LeatherHub MM2",
-    subtitle = "Discord.gg/kQs7zvTwnX",
+    subtitle = "MenuKey: Right Alt | Discord.gg/kQs7zvTwnX",
     logo = "https://raw.githubusercontent.com/qisery/mm2/main/moto1.jpg",
     logoSize = 32,
     size = Vector2 and Vector2.new(950, 650) or nil,
