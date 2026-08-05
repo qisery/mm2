@@ -4380,43 +4380,200 @@ end)
 defineModule("farm", function(Ctx)
     local Lib = Ctx.Lib
     local Workspace = Services.Workspace
+    local RunService = Services.RunService or game:GetService("RunService")
+
     local SAFE_OFFSET = 5
-    local FIRST_TRIP_SPEED = 999
+    local MAX_STEP = 6           
     local BELOW_MAP_Y = -500
+    local SAFE_Y_MARGIN = 25
+    local TRAVEL_TIMEOUT = 10
+    local TOUCH_ATTEMPTS = 4
+    local HOLD_FRAMES = 10
+    local PICKUP_WOBBLE = 0.8
+    local COIN_COOLDOWN = 5      
     local MURDERER_CAMP_SPOT = CFrame.new(-1.79, -64.45, -85.25)
+
+    local PRONE_ROT = CFrame.Angles(math.rad(-90), 0, 0)
+    local PRONE_UP = PRONE_ROT.UpVector
+
+    local fireTouch = (typeof(firetouchinterest) == "function" and firetouchinterest)
+        or (typeof(fireTouchInterest) == "function" and fireTouchInterest)
+        or nil
 
     local config = {
         enabled = false,
         killAfterFarm = false,
+        layFlat = true,
+        removeBarriers = true,
         maxCoins = 40,
         speed = 25,
     }
 
     local farmRunning = false
+    local bagHandled = false
+    local coinLabel = nil
+    local originalCollisions = {}
+    local noclipParts = {}
+    local lastNoclipRefresh = 0
+    local coinCooldown = {}
 
-    local function setNoclip()
+    local function isValid(object)
+        return object and object.Parent ~= nil
+    end
+
+    ----------------------------------------------------------------
+    -- NOCLIP
+    ----------------------------------------------------------------
+
+    local function refreshNoclipParts()
+        table.clear(noclipParts)
         local character = LocalPlayer.Character
         if not (character and character.Parent) then
             return
         end
-        for _, part in ipairs(character:GetChildren()) do
+
+        for _, part in ipairs(character:GetDescendants()) do
             if part:IsA("BasePart") then
+                noclipParts[#noclipParts + 1] = part
+                if originalCollisions[part] == nil then
+                    originalCollisions[part] = part.CanCollide
+                end
+            end
+        end
+        lastNoclipRefresh = os.clock()
+    end
+
+    local function setNoclip()
+        if os.clock() - lastNoclipRefresh > 1 then
+            refreshNoclipParts()
+        end
+        for i = #noclipParts, 1, -1 do
+            local part = noclipParts[i]
+            if not isValid(part) then
+                table.remove(noclipParts, i)
+            elseif part.CanCollide then
                 part.CanCollide = false
             end
         end
     end
 
     local function restoreCollisions()
-        local character = LocalPlayer.Character
-        if not character then
-            return
-        end
-        for _, part in ipairs(character:GetDescendants()) do
-            if part:IsA("BasePart") then
-                part.CanCollide = true
+        for part, original in pairs(originalCollisions) do
+            if isValid(part) and original then
+                pcall(function() part.CanCollide = true end)
             end
         end
+        table.clear(originalCollisions)
+        table.clear(noclipParts)
     end
+
+    ----------------------------------------------------------------
+    -- BARRIERS
+    ----------------------------------------------------------------
+
+    local BARRIER_NAMES = {
+        Invis = true,
+        InvisWall = true,
+        InvisWalls = true,
+        Barrier = true,
+        Barriers = true,
+    }
+
+    local barrierWatcher = nil
+
+    local function isBarrier(object)
+        if not BARRIER_NAMES[object.Name] then
+            return false
+        end
+
+        return object:IsA("BasePart") or object:IsA("Folder")
+            or (object:IsA("Model") and not object:FindFirstChildOfClass("Humanoid"))
+    end
+
+    local function removeBarrier(object)
+        if not isValid(object) then
+            return false
+        end
+        return (pcall(object.Destroy, object))
+    end
+
+    local function sweepBarriers()
+        local removed = 0
+        for _, object in ipairs(Workspace:GetDescendants()) do
+
+            if object:IsDescendantOf(Workspace) and isBarrier(object) and removeBarrier(object) then
+                removed = removed + 1
+            end
+        end
+        return removed
+    end
+
+    local function startBarrierWatcher()
+        if barrierWatcher then
+            return
+        end
+
+        barrierWatcher = Workspace.DescendantAdded:Connect(function(object)
+            if config.enabled and config.removeBarriers and isBarrier(object) then
+                removeBarrier(object)
+            end
+        end)
+    end
+
+    local function stopBarrierWatcher()
+        if barrierWatcher then
+            barrierWatcher:Disconnect()
+            barrierWatcher = nil
+        end
+    end
+
+    ----------------------------------------------------------------
+    -- PRONE
+    ----------------------------------------------------------------
+
+    local function getHumanoid()
+        local character = LocalPlayer.Character
+        return character and character:FindFirstChildOfClass("Humanoid") or nil
+    end
+
+    local function setProne(active)
+        local humanoid = getHumanoid()
+        if not humanoid then
+            return
+        end
+        pcall(function()
+            humanoid.PlatformStand = active
+            humanoid.AutoRotate = not active
+        end)
+    end
+
+    local function facing(root)
+        if config.layFlat then
+            return PRONE_ROT
+        end
+        return root.CFrame - root.CFrame.Position
+    end
+
+    local function placeAt(root, position)
+        root.CFrame = CFrame.new(position) * facing(root)
+    end
+
+    local function holdProne(root)
+        if not config.layFlat then
+            return
+        end
+        local humanoid = getHumanoid()
+        if humanoid and not humanoid.PlatformStand then
+            setProne(true)
+        end
+        if root.CFrame.UpVector:Dot(PRONE_UP) < 0.999 then
+            placeAt(root, root.Position)
+        end
+    end
+
+    ----------------------------------------------------------------
+    -- STATE
+    ----------------------------------------------------------------
 
     local function canFarm()
         if not Util.isAlive() then
@@ -4425,53 +4582,198 @@ defineModule("farm", function(Ctx)
         return LocalPlayer:GetAttribute("Alive") ~= false
     end
 
-    local function getCarriedCoins()
-        local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
-        local coinBags = playerGui
-            and playerGui:FindFirstChild("MainGUI")
-            and playerGui.MainGUI:FindFirstChild("Game")
-            and playerGui.MainGUI.Game:FindFirstChild("CoinBags")
-        local label = coinBags
-            and coinBags:FindFirstChild("Container")
-            and coinBags.Container:FindFirstChild("Coin")
-            and coinBags.Container.Coin:FindFirstChild("CurrencyFrame")
-        label = label and label:FindFirstChild("Icon")
-        label = label and label:FindFirstChild("Coins")
+    local function safeY(y)
+        local floor = BELOW_MAP_Y
+        local ok, height = pcall(function() return Workspace.FallenPartsDestroyHeight end)
+        if ok and type(height) == "number" then
+            floor = height + SAFE_Y_MARGIN
+        end
+        return math.max(y, floor)
+    end
 
-        return label and tonumber(label.Text) or 0
+    local function getPos(object)
+        if not isValid(object) then
+            return nil
+        end
+        if object:IsA("BasePart") then
+            return object.Position
+        elseif object:IsA("Model") then
+            local ok, pivot = pcall(object.GetPivot, object)
+            if ok then return pivot.Position end
+        end
+        return nil
+    end
+
+    local function zeroVelocity(root)
+        local ok = pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+        end)
+        if not ok then
+            pcall(function() root.Velocity = Vector3.zero end)
+        end
+    end
+
+    local function getCarriedCoins()
+        if not isValid(coinLabel) then
+            local node = LocalPlayer:FindFirstChild("PlayerGui")
+            local path = { "MainGUI", "Game", "CoinBags", "Container", "Coin", "CurrencyFrame", "Icon", "Coins" }
+            for _, name in ipairs(path) do
+                node = node and node:FindFirstChild(name)
+            end
+            coinLabel = node
+        end
+        if not isValid(coinLabel) then
+            return 0
+        end
+        return tonumber((tostring(coinLabel.Text):gsub("%D", ""))) or 0
     end
 
     local function roundOver()
         local timerPart = Workspace:FindFirstChild("RoundTimerPart")
-        local remaining = timerPart and timerPart:GetAttribute("Time")
-        return remaining ~= nil and remaining <= 0
+        if not isValid(timerPart) then
+            return false
+        end
+        local remaining = timerPart:GetAttribute("Time")
+        return type(remaining) == "number" and remaining <= 0
+    end
+
+    local function benchCoin(coin)
+        coinCooldown[coin] = os.clock() + COIN_COOLDOWN
+    end
+
+    local function isBenched(coin)
+        local expiry = coinCooldown[coin]
+        if not expiry then
+            return false
+        end
+        if os.clock() >= expiry then
+            coinCooldown[coin] = nil
+            return false
+        end
+        return true
     end
 
     local function nearestCoin(container, position)
         local closest, closestDistance = nil, math.huge
 
         for _, object in ipairs(container:GetChildren()) do
-            if object.Parent and object.Name == "Coin_Server" and object:FindFirstChild("TouchInterest") then
-                local distance = (object.Position - position).Magnitude
-                if distance < closestDistance then
-                    closestDistance, closest = distance, object
+            if isValid(object) and object.Name == "Coin_Server" and object:FindFirstChild("TouchInterest") then
+                if not isBenched(object) then
+                    local coinPos = getPos(object)
+                    if coinPos then
+                        local distance = (coinPos - position).Magnitude
+                        if distance < closestDistance then
+                            closestDistance, closest = distance, object
+                        end
+                    end
                 end
             end
         end
 
         return closest
     end
+
+    ----------------------------------------------------------------
+    -- MOVEMENT
+    ----------------------------------------------------------------
+
+    local function stepTo(root, goal, dt)
+        local current = root.Position
+        local delta = goal - current
+        local distance = delta.Magnitude
+
+        if distance < 0.1 then
+            zeroVelocity(root)
+            return true
+        end
+
+        local step = math.min(math.max(1, config.speed) * dt, MAX_STEP, distance)
+        local nextPos = current + (delta.Unit * step)
+        nextPos = Vector3.new(nextPos.X, safeY(nextPos.Y), nextPos.Z)
+
+        placeAt(root, nextPos)
+        zeroVelocity(root)
+        return false
+    end
+
+    local function moveTo(root, getGoal, timeout)
+        local deadline = os.clock() + timeout
+
+        while true do
+            if not config.enabled then return false end
+            if not isValid(root) then return false end
+            if os.clock() > deadline then return false end
+            if not canFarm() then return false end
+
+            local goal = getGoal()
+            if not goal then return false end
+
+            local dt = RunService.Heartbeat:Wait()
+            if stepTo(root, goal, dt) then return true end
+        end
+    end
+
+    local function overlapCoin(root, coin)
+        for i = 1, HOLD_FRAMES do
+            if not config.enabled then return end
+            if not isValid(root) or not isValid(coin) then return end
+
+            local coinPos = getPos(coin)
+            if not coinPos then return end
+
+            local wobble = (i % 2 == 0) and PICKUP_WOBBLE or -PICKUP_WOBBLE
+            local goal = Vector3.new(coinPos.X, safeY(coinPos.Y + wobble), coinPos.Z)
+            placeAt(root, goal)
+            zeroVelocity(root)
+            RunService.Heartbeat:Wait()
+        end
+    end
+
+    local function collectCoin(root, coin)
+
+        moveTo(root, function()
+            local coinPos = getPos(coin)
+            return coinPos and Vector3.new(coinPos.X, safeY(coinPos.Y - SAFE_OFFSET), coinPos.Z) or nil
+        end, TRAVEL_TIMEOUT)
+
+        if not isValid(coin) then return true end
+
+        -- preferred: collect from below without surfacing
+        if fireTouch and coin:IsA("BasePart") then
+            for _ = 1, TOUCH_ATTEMPTS do
+                if not isValid(coin) then return true end
+                pcall(fireTouch, root, coin, 0)
+                RunService.Heartbeat:Wait()
+                pcall(fireTouch, root, coin, 1)
+                RunService.Heartbeat:Wait()
+            end
+            if not isValid(coin) then return true end
+        end
+
+        if not config.enabled then return false end
+        moveTo(root, function()
+            local coinPos = getPos(coin)
+            return coinPos and Vector3.new(coinPos.X, safeY(coinPos.Y), coinPos.Z) or nil
+        end, TRAVEL_TIMEOUT)
+
+        overlapCoin(root, coin)
+        return not isValid(coin)
+    end
+
     local function afterBagFull()
+        local root = Util.getHRP()
+        if not root then
+            return
+        end
+
         if Util.getPlayerRole(LocalPlayer) == "Murderer" then
             if not config.killAfterFarm then
                 return
             end
 
-            local root = Util.getHRP()
-            if root then
-                root.CFrame = MURDERER_CAMP_SPOT
-                task.wait(0.2)
-            end
+            moveTo(root, function() return MURDERER_CAMP_SPOT.Position end, TRAVEL_TIMEOUT)
+            task.wait(0.2)
 
             if Ctx.Combat then
                 task.spawn(Ctx.Combat.runAutoKill, true)
@@ -4479,95 +4781,100 @@ defineModule("farm", function(Ctx)
             return
         end
 
-        local root = Util.getHRP()
-        if root then
-            root.CFrame = CFrame.new(root.Position.X, BELOW_MAP_Y, root.Position.Z)
-        end
+        moveTo(root, function()
+            return Vector3.new(root.Position.X, safeY(BELOW_MAP_Y), root.Position.Z)
+        end, TRAVEL_TIMEOUT)
     end
-    local function glideTo(root, coin, speed)
-        local from = root.Position - Vector3.new(0, SAFE_OFFSET, 0)
-        local to = coin.Position - Vector3.new(0, SAFE_OFFSET, 0)
-        local duration = (from - to).Magnitude / speed
 
-        if duration <= 0.001 then
-            return
-        end
-
-        local startedAt = os.clock()
-        local finished = false
-        local handle
-
-        handle = Scheduler.onRender("farm.glide", function()
-            if not config.enabled or not canFarm() or not root.Parent or not coin.Parent then
-                finished = true
-                handle.stop()
-                return
-            end
-
-            local alpha = math.min(1, (os.clock() - startedAt) / duration)
-            root.CFrame = CFrame.new(from:Lerp(to, alpha))
-            root.AssemblyLinearVelocity = Vector3.zero
-
-            if alpha >= 1 then
-                finished = true
-                handle.stop()
-            end
-        end)
-
-        while not finished do
-            task.wait()
-        end
-    end
+    ----------------------------------------------------------------
+    -- LOOP
+    ----------------------------------------------------------------
 
     local function runFarm()
         if farmRunning then
             return
         end
         farmRunning = true
+        bagHandled = false
+        table.clear(coinCooldown)
+
+        if not fireTouch then
+            Lib:Notify("Auto Farm", "No firetouchinterest - surfacing to grab coins.", 4, "warning")
+        end
+
+        if config.removeBarriers then
+            startBarrierWatcher()
+            local removed = sweepBarriers()
+            if removed > 0 then
+                Lib:Notify("Auto Farm", "Removed " .. removed .. " barriers.", 3, "success")
+            end
+        end
+
+        setProne(config.layFlat)
+
         local keepAlive = Scheduler.onHeartbeat("farm.keepAlive", function()
             local root = Util.getHRP()
             if root then
-                root.AssemblyLinearVelocity = Vector3.zero
+                zeroVelocity(root)
+                holdProne(root)
             end
             setNoclip()
         end)
 
-        local firstTrip = true
-
         while config.enabled do
-            task.wait(0.05)
+            task.wait(0.1)
 
-            if roundOver() or not canFarm() then
-                firstTrip = true
+            if roundOver() then
+                coinLabel = nil
+                bagHandled = false
+                table.clear(coinCooldown)
                 task.wait(0.5)
-            elseif getCarriedCoins() >= config.maxCoins then
-                afterBagFull()
-                task.wait(1)
+            elseif not canFarm() then
+                task.wait(0.5)
             else
-                local container = Util.findCoinContainer()
-                local root = Util.getHRP()
+                local carried = getCarriedCoins()
+                if carried < config.maxCoins then
+                    bagHandled = false
+                end
 
-                if not container or not root then
-                    firstTrip = true
-                    task.wait(0.5)
-                else
-                    setNoclip()
+                if carried >= config.maxCoins then
 
-                    local coin = nearestCoin(container, root.Position)
-                    if coin then
-                        glideTo(root, coin, firstTrip and FIRST_TRIP_SPEED or math.max(10, config.speed))
-
-                        if root.Parent and coin.Parent and config.enabled then
-                            root.CFrame = CFrame.new(coin.Position)
+                    if not bagHandled then
+                        bagHandled = true
+                        local ok, err = pcall(afterBagFull)
+                        if not ok then
+                            warn("[farm] afterBagFull: " .. tostring(err))
                         end
+                    end
+                    task.wait(1)
+                else
+                    local container = Util.findCoinContainer()
+                    local root = Util.getHRP()
 
-                        firstTrip = false
+                    if not container or not root then
+                        task.wait(0.5)
+                    else
+                        setNoclip()
+
+                        local coin = nearestCoin(container, root.Position)
+                        if coin then
+                            -- pcall so an error mid-run can't wedge the loop
+                            local ok, collected = pcall(collectCoin, root, coin)
+                            if not ok then
+                                warn("[farm] collect: " .. tostring(collected))
+                                benchCoin(coin)
+                            elseif not collected then
+                                benchCoin(coin)
+                            end
+                        end
                     end
                 end
             end
         end
 
         keepAlive.stop()
+        stopBarrierWatcher()
+        setProne(false)
         farmRunning = false
     end
 
@@ -4584,7 +4891,28 @@ defineModule("farm", function(Ctx)
             Lib:Notify("Auto Farm", "Started farming!", 3, "success")
         else
             restoreCollisions()
+            stopBarrierWatcher()
+            setProne(false)
             Lib:Notify("Auto Farm", "Stopped farming.", 3, "warning")
+        end
+    end)
+
+    farmSection:Toggle("Lay Flat (Under Map Look)", true, function(enabled)
+        config.layFlat = enabled
+        if config.enabled then
+            setProne(enabled)
+        elseif not enabled then
+            setProne(false)
+        end
+    end)
+
+    farmSection:Toggle("Remove Map Barriers", true, function(enabled)
+        config.removeBarriers = enabled
+        if not enabled then
+            stopBarrierWatcher()
+        elseif config.enabled then
+            startBarrierWatcher()
+            sweepBarriers()
         end
     end)
 
