@@ -730,6 +730,12 @@ local livePartner = ""
 local liveYourItems, liveYourTotal, liveYourUnpriced = {}, 0, 0
 local liveTheirItems, liveTheirTotal, liveTheirUnpriced = {}, 0, 0
 
+-- In-game overlay state. updateOverlay is filled in further down, once the
+-- connection bookkeeping exists; recompute() only calls it if it is there.
+local overlayEnabled = true
+local overlayTags = true
+local updateOverlay
+
 local function comma(n)
     local neg = ""
     n = math.floor(tonumber(n) or 0)
@@ -806,6 +812,46 @@ local function buildFromOffer(offerTable)
     return items, total, unpriced
 end
 
+-- The visible trade window itself. Also the anchor the in-game overlay
+-- pins itself to, so both readers agree on what "the trade" is.
+local function getTradeFrame()
+    local cont = TradeGUI:FindFirstChild("Container")
+    return cont and cont:FindFirstChild("Trade")
+end
+
+-- Reads one NewItem slot straight off the trade window. Returns nil for
+-- empty or still-loading slots. Used both by the UI fallback below and by
+-- the overlay, which needs values per slot rather than per offer.
+local function readSlotItem(slot)
+    if not (slot and slot.Visible) then return nil end
+
+    local nameFrame = slot:FindFirstChild("ItemName")
+    local label = nameFrame and nameFrame:FindFirstChild("Label")
+    if not (label and label:IsA("TextLabel")) then return nil end
+
+    local name = ((label.Text or ""):gsub("<[^>]+>", "")):match("^%s*(.-)%s*$")
+    local lower = name:lower()
+    if name == "" or lower == "loading" or lower == "label" then return nil end
+
+    -- Each slot has a dedicated Chroma tag frame, which is far more
+    -- reliable than sniffing descendant names and images.
+    local tags = slot:FindFirstChild("Tags")
+    local chromaTag = tags and tags:FindFirstChild("Chroma")
+    if chromaTag and chromaTag:IsA("GuiObject") and chromaTag.Visible
+        and not lower:find("chroma", 1, true) then
+        name = "Chroma " .. name
+    end
+
+    local qty = 1
+    local slotCont = slot:FindFirstChild("Container")
+    local amtLabel = slotCont and slotCont:FindFirstChild("Amount")
+    if amtLabel and amtLabel:IsA("TextLabel") then
+        qty = tonumber((amtLabel.Text or ""):match("x%s*(%d+)")) or 1
+    end
+
+    return { name = name, qty = qty, value = lookupValue(name) }
+end
+
 -- Fallback used only until the first UpdateTrade fires, i.e. when the
 -- script is executed while a trade is already open.
 local function buildFromUI(offerFrame)
@@ -814,39 +860,14 @@ local function buildFromUI(offerFrame)
     if not cont then return items, total, unpriced end
 
     for i = 1, MAX_SLOTS do
-        local slot = cont:FindFirstChild("NewItem" .. i)
-        if slot and slot.Visible then
-            local nameFrame = slot:FindFirstChild("ItemName")
-            local label = nameFrame and nameFrame:FindFirstChild("Label")
-            if label and label:IsA("TextLabel") then
-                local name = ((label.Text or ""):gsub("<[^>]+>", "")):match("^%s*(.-)%s*$")
-                local lower = name:lower()
-                if name ~= "" and lower ~= "loading" and lower ~= "label" then
-                    -- Each slot has a dedicated Chroma tag frame, which is far
-                    -- more reliable than sniffing descendant names and images.
-                    local tags = slot:FindFirstChild("Tags")
-                    local chromaTag = tags and tags:FindFirstChild("Chroma")
-                    if chromaTag and chromaTag:IsA("GuiObject") and chromaTag.Visible
-                        and not lower:find("chroma", 1, true) then
-                        name = "Chroma " .. name
-                    end
-
-                    local qty = 1
-                    local slotCont = slot:FindFirstChild("Container")
-                    local amtLabel = slotCont and slotCont:FindFirstChild("Amount")
-                    if amtLabel and amtLabel:IsA("TextLabel") then
-                        qty = tonumber((amtLabel.Text or ""):match("x%s*(%d+)")) or 1
-                    end
-
-                    local val = lookupValue(name)
-                    if val then
-                        total = total + (val * qty)
-                    else
-                        unpriced = unpriced + 1
-                    end
-                    table.insert(items, { name = name, qty = qty, value = val })
-                end
+        local item = readSlotItem(cont:FindFirstChild("NewItem" .. i))
+        if item then
+            if item.value then
+                total = total + (item.value * item.qty)
+            else
+                unpriced = unpriced + 1
             end
+            table.insert(items, item)
         end
     end
     return items, total, unpriced
@@ -950,6 +971,8 @@ local function recompute()
     end
 
     updateResult()
+
+    if updateOverlay then updateOverlay() end
 end
 
 --================================================================--
@@ -966,6 +989,298 @@ if _G.__TradeCheckerConns then
     end
 end
 _G.__TradeCheckerConns = {}
+
+--================================================================--
+--                   IN-GAME TRADE OVERLAY                        --
+--================================================================--
+-- Puts the checker on MM2's own trade window instead of only in the
+-- menu: a value bar pinned to the trade frame, plus a value tag on every
+-- filled item slot. The bar fills from the left with your share of the
+-- pot, so the tick in the middle is the break-even point - fill short of
+-- it means profit, past it means loss.
+--
+-- Nothing here is parented into the game's GUI; the overlay is its own
+-- ScreenGui that tracks the trade window by AbsolutePosition, so MM2's
+-- own trade code never sees an unexpected child.
+
+do
+
+local RunService = game:GetService("RunService")
+
+local PANEL_W_MIN, PANEL_W_MAX, PANEL_H, BAR_H, TAG_H = 280, 620, 80, 26, 18
+local COL_WIN = Color3.fromRGB(60, 220, 110)
+local COL_LOSE = Color3.fromRGB(240, 70, 70)
+local COL_FAIR = Color3.fromRGB(235, 235, 235)
+
+local function make(class, props, parent)
+    local inst = Instance.new(class)
+    for prop, value in pairs(props) do
+        inst[prop] = value
+    end
+    inst.Parent = parent
+    return inst
+end
+
+-- Executors hide GUIs in different places; CoreGui is not always writable.
+local function overlayParent()
+    local ok, hidden = pcall(function() return gethui and gethui() end)
+    if ok and hidden then return hidden end
+    local okCore, core = pcall(function() return game:GetService("CoreGui") end)
+    if okCore and core then return core end
+    return LocalPlayer:WaitForChild("PlayerGui")
+end
+
+for _, place in ipairs({ overlayParent(), LocalPlayer:FindFirstChild("PlayerGui") }) do
+    local stale = place and place:FindFirstChild("LeatherHubTradeOverlay")
+    if stale then pcall(function() stale:Destroy() end) end
+end
+
+local screen = Instance.new("ScreenGui")
+screen.Name = "LeatherHubTradeOverlay"
+screen.ResetOnSpawn = false
+screen.DisplayOrder = 9999
+screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+screen.IgnoreGuiInset = TradeGUI.IgnoreGuiInset
+screen.Enabled = false
+if not pcall(function() screen.Parent = overlayParent() end) then
+    screen.Parent = LocalPlayer:WaitForChild("PlayerGui")
+end
+pcall(function() if syn and syn.protect_gui then syn.protect_gui(screen) end end)
+
+local panel = make("Frame", {
+    Name = "Panel",
+    BackgroundColor3 = Color3.fromRGB(22, 22, 26),
+    BackgroundTransparency = 0.08,
+    BorderSizePixel = 0,
+    Size = UDim2.fromOffset(PANEL_W_MIN, PANEL_H),
+    Visible = false
+}, screen)
+make("UICorner", { CornerRadius = UDim.new(0, 8) }, panel)
+make("UIStroke", { Color = Color3.fromRGB(70, 70, 82), Thickness = 1, Transparency = 0.25 }, panel)
+
+local statusLabel = make("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(0, 6),
+    Size = UDim2.new(1, 0, 0, 20),
+    Font = Enum.Font.GothamBold,
+    TextSize = 16,
+    Text = "WAITING FOR ITEMS",
+    TextColor3 = COL_FAIR
+}, panel)
+
+local bar = make("Frame", {
+    BackgroundColor3 = Color3.fromRGB(44, 44, 52),
+    BorderSizePixel = 0,
+    Position = UDim2.new(0, 10, 0, 30),
+    Size = UDim2.new(1, -20, 0, BAR_H)
+}, panel)
+make("UICorner", { CornerRadius = UDim.new(0, 4) }, bar)
+
+local fill = make("Frame", {
+    BackgroundColor3 = COL_FAIR,
+    BorderSizePixel = 0,
+    Size = UDim2.new(0, 0, 1, 0),
+    ZIndex = 2
+}, bar)
+make("UICorner", { CornerRadius = UDim.new(0, 4) }, fill)
+
+-- Break-even marker: your offer is worth exactly theirs when the fill
+-- lands here.
+make("Frame", {
+    BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+    BackgroundTransparency = 0.3,
+    BorderSizePixel = 0,
+    AnchorPoint = Vector2.new(0.5, 0),
+    Position = UDim2.new(0.5, 0, 0, 0),
+    Size = UDim2.new(0, 2, 1, 0),
+    ZIndex = 3
+}, bar)
+
+local yourBarLabel = make("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.new(0, 8, 0, 0),
+    Size = UDim2.new(0.5, -10, 1, 0),
+    Font = Enum.Font.GothamBold,
+    TextSize = 13,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextColor3 = Color3.fromRGB(255, 255, 255),
+    TextStrokeTransparency = 0.4,
+    Text = "YOU 0",
+    ZIndex = 4
+}, bar)
+
+local theirBarLabel = make("TextLabel", {
+    BackgroundTransparency = 1,
+    AnchorPoint = Vector2.new(1, 0),
+    Position = UDim2.new(1, -8, 0, 0),
+    Size = UDim2.new(0.5, -10, 1, 0),
+    Font = Enum.Font.GothamBold,
+    TextSize = 13,
+    TextXAlignment = Enum.TextXAlignment.Right,
+    TextColor3 = Color3.fromRGB(255, 255, 255),
+    TextStrokeTransparency = 0.4,
+    Text = "0 THEM",
+    ZIndex = 4
+}, bar)
+
+local detailLabel = make("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.new(0, 10, 0, 59),
+    Size = UDim2.new(1, -20, 0, 16),
+    Font = Enum.Font.Gotham,
+    TextSize = 12,
+    TextColor3 = Color3.fromRGB(185, 185, 195),
+    Text = ""
+}, panel)
+
+-- One tag per slot per side, created up front and simply moved around.
+local SIDES = { { key = "your", frame = "YourOffer" }, { key = "their", frame = "TheirOffer" } }
+local slotTags = { your = {}, their = {} }
+local slotItems = { your = {}, their = {} }
+
+for _, side in ipairs(SIDES) do
+    for i = 1, MAX_SLOTS do
+        local tag = make("TextLabel", {
+            Name = side.key .. "Tag" .. i,
+            BackgroundColor3 = Color3.fromRGB(16, 16, 20),
+            BackgroundTransparency = 0.15,
+            BorderSizePixel = 0,
+            Font = Enum.Font.GothamBold,
+            TextSize = 12,
+            TextColor3 = COL_FAIR,
+            Text = "",
+            Visible = false,
+            ZIndex = 2
+        }, screen)
+        make("UICorner", { CornerRadius = UDim.new(0, 4) }, tag)
+        make("UIStroke", { Color = Color3.fromRGB(70, 70, 82), Thickness = 1, Transparency = 0.35 }, tag)
+        slotTags[side.key][i] = tag
+    end
+end
+
+-- Panel contents. Driven by the live offers only: the manual dropdowns are
+-- a menu-side planning tool and would be misleading pinned to a real trade.
+local function refreshPanel()
+    local pot = liveYourTotal + liveTheirTotal
+    local diff = liveTheirTotal - liveYourTotal
+    local colour, text
+
+    if pot == 0 then
+        colour, text = COL_FAIR, "WAITING FOR ITEMS"
+    elseif diff > 0 then
+        colour, text = COL_WIN, "YOU WIN  +" .. comma(diff)
+    elseif diff < 0 then
+        colour, text = COL_LOSE, "YOU LOSE  -" .. comma(-diff)
+    else
+        colour, text = COL_FAIR, "FAIR TRADE"
+    end
+
+    statusLabel.Text = text
+    statusLabel.TextColor3 = colour
+    fill.BackgroundColor3 = colour
+    fill.Size = UDim2.new(pot > 0 and (liveYourTotal / pot) or 0, 0, 1, 0)
+
+    yourBarLabel.Text = "YOU  " .. comma(liveYourTotal)
+    theirBarLabel.Text = comma(liveTheirTotal) .. "  THEM"
+
+    local unpriced = liveYourUnpriced + liveTheirUnpriced
+    local detail = "Trading with " .. (livePartner ~= "" and livePartner or "-")
+    if unpriced > 0 then
+        detail = detail .. "  |  " .. unpriced .. " item" .. (unpriced == 1 and "" or "s") .. " with no listed value"
+        detailLabel.TextColor3 = Color3.fromRGB(255, 180, 60)
+    else
+        detailLabel.TextColor3 = Color3.fromRGB(185, 185, 195)
+    end
+    detailLabel.Text = detail
+end
+
+-- Re-reading eight slots every frame is wasteful; positions still need to
+-- track the window frame by frame, so only the text is throttled.
+local lastRead = 0
+
+local function readSlots(trade)
+    for _, side in ipairs(SIDES) do
+        local cont = trade:FindFirstChild(side.frame)
+        cont = cont and cont:FindFirstChild("Container")
+        for i = 1, MAX_SLOTS do
+            local slot = cont and cont:FindFirstChild("NewItem" .. i)
+            local item = overlayTags and slot and readSlotItem(slot) or nil
+            slotItems[side.key][i] = item and slot or nil
+
+            local tag = slotTags[side.key][i]
+            if item then
+                if item.value then
+                    tag.Text = comma(item.value * item.qty)
+                    tag.TextColor3 = COL_FAIR
+                else
+                    tag.Text = "?"
+                    tag.TextColor3 = Color3.fromRGB(255, 180, 60)
+                end
+            end
+        end
+    end
+end
+
+local function layout()
+    local trade = getTradeFrame()
+    local show = overlayEnabled and TradeGUI.Enabled and trade ~= nil and trade.AbsoluteSize.X > 0
+    if screen.Enabled ~= show then screen.Enabled = show end
+    if not show then return end
+
+    -- Match the game's inset handling, otherwise AbsolutePosition and our
+    -- own offsets are measured from different origins.
+    if screen.IgnoreGuiInset ~= TradeGUI.IgnoreGuiInset then
+        screen.IgnoreGuiInset = TradeGUI.IgnoreGuiInset
+    end
+
+    local pos, size = trade.AbsolutePosition, trade.AbsoluteSize
+    local width = math.clamp(size.X, PANEL_W_MIN, PANEL_W_MAX)
+    local y = pos.Y - PANEL_H - 8
+    if y < 4 then y = pos.Y + 8 end -- no room above: sit inside the window
+
+    panel.Size = UDim2.fromOffset(width, PANEL_H)
+    panel.Position = UDim2.fromOffset(math.max(math.floor(pos.X + (size.X - width) / 2), 4), math.floor(y))
+    panel.Visible = true
+
+    local now = os.clock()
+    if now - lastRead > 0.1 then
+        lastRead = now
+        readSlots(trade)
+    end
+
+    -- Tags sit on the top edge *inside* their slot. Staying inside the slot
+    -- bounds keeps them correct whatever layout the offer grid uses, and the
+    -- top edge leaves the item name at the bottom of the slot readable.
+    for _, side in ipairs(SIDES) do
+        for i = 1, MAX_SLOTS do
+            local slot = slotItems[side.key][i]
+            local tag = slotTags[side.key][i]
+            if slot and slot.Parent and slot.Visible then
+                local sp, ss = slot.AbsolutePosition, slot.AbsoluteSize
+                tag.Size = UDim2.fromOffset(math.max(math.floor(ss.X), 44), TAG_H)
+                tag.Position = UDim2.fromOffset(math.floor(sp.X), math.floor(sp.Y + 2))
+                tag.Visible = true
+            else
+                tag.Visible = false
+            end
+        end
+    end
+end
+
+updateOverlay = function()
+    pcall(refreshPanel)
+    pcall(layout)
+end
+
+table.insert(_G.__TradeCheckerConns, RunService.RenderStepped:Connect(function()
+    if myGen ~= _G.__TradeCheckerGen then
+        pcall(function() screen:Destroy() end)
+        return
+    end
+    pcall(layout)
+end))
+
+end
 
 -- Authoritative source: exact ItemIDs, amounts and chroma flags. The game's
 -- own TradeModule listens to this same event; adding a listener is additive.
@@ -1010,12 +1325,13 @@ end))
 
 -- Safety net: if the script was executed mid-trade, no UpdateTrade fires
 -- until someone changes an offer, so read the window directly until it does.
+-- The overlay reads the same live totals, so keep polling for it even when
+-- Live Mode is off (that toggle only decides what the menu tab shows).
 task.spawn(function()
     while myGen == _G.__TradeCheckerGen do
-        if liveMode and TradeGUI.Enabled and not haveEvent then
+        if (liveMode or overlayEnabled) and TradeGUI.Enabled and not haveEvent then
             tradeOpen = true
-            local trade = TradeGUI:FindFirstChild("Container")
-            trade = trade and trade:FindFirstChild("Trade")
+            local trade = getTradeFrame()
             if trade then
                 local yourFrame = trade:FindFirstChild("YourOffer")
                 local theirFrame = trade:FindFirstChild("TheirOffer")
@@ -1036,6 +1352,16 @@ end)
 resSec:Toggle("Live Mode (read trade window)", true, function(state)
     liveMode = state
     recompute()
+end)
+
+resSec:Toggle("In-Game Trade Overlay", true, function(state)
+    overlayEnabled = state
+    if updateOverlay then updateOverlay() end
+end)
+
+resSec:Toggle("Overlay Item Value Tags", true, function(state)
+    overlayTags = state
+    if updateOverlay then updateOverlay() end
 end)
 
 --================================================================--
