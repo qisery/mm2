@@ -9,62 +9,471 @@
 --                    SERVICES & CONSTANTS                        --
 --================================================================--
 
-local HttpService = game:GetService("HttpService")
+local Services = {
+    Players = game:GetService("Players"),
+    RunService = game:GetService("RunService"),
+    UserInputService = game:GetService("UserInputService"),
+    GuiService = game:GetService("GuiService"),
+    HttpService = game:GetService("HttpService"),
+    ReplicatedStorage = game:GetService("ReplicatedStorage"),
+    Workspace = game:GetService("Workspace"),
+}
+
+local LocalPlayer = Services.Players.LocalPlayer
+
 local API_URL = "https://mm2-api.onrender.com/api/all"
-
-local Players = game:GetService("Players")
-local UserInputService = game:GetService("UserInputService")
-local GuiService = game:GetService("GuiService")
-
 local OBSIDIAN_REPO = "https://raw.githubusercontent.com/deividcomsono/Obsidian/main/"
+local LOGO_URL = "https://raw.githubusercontent.com/qisery/mm2/main/moto1.jpg"
 
 --================================================================--
---                  OBSIDIAN LIBRARY LOADING                      --
+--                     SESSION (re-execution)                     --
 --================================================================--
 
-local function safeLoad(url)
-    local ok, loaded = pcall(function()
-        return loadstring(game:HttpGet(url))()
+local Session = {}
+do
+    local SESSION_KEY = "__LeatherHubMM2"
+    local ok, shared = pcall(function()
+        return type(getgenv) == "function" and getgenv() or _G
     end)
-    if ok then
-        return loaded
+    local env = (ok and shared) or _G
+
+    local store = env[SESSION_KEY]
+    if type(store) ~= "table" then
+        store = { generation = 0, connections = {} }
+        env[SESSION_KEY] = store
     end
-    return nil
-end
 
-local ObsidianLib = safeLoad(OBSIDIAN_REPO .. "Library.lua")
-if not ObsidianLib then
-    warn("Failed to load Obsidian UI Library")
-    return
-end
-
-local ThemeManager = safeLoad(OBSIDIAN_REPO .. "addons/ThemeManager.lua")
-local SaveManager = safeLoad(OBSIDIAN_REPO .. "addons/SaveManager.lua")
-
---================================================================--
---                       SMALL HELPERS                            --
---================================================================--
-
-local function toKeyCode(key)
-    if typeof(key) == "EnumItem" then
-        return key
+    for _, connection in ipairs(store.connections) do
+        pcall(function()
+            connection:Disconnect()
+        end)
     end
-    if type(key) ~= "string" then
-        return Enum.KeyCode.RightControl
+
+    store.connections = {}
+    store.generation = store.generation + 1
+
+    function Session.track(connection)
+        table.insert(store.connections, connection)
+        return connection
     end
-    local normalized = key:gsub("%s+", "")
-    return Enum.KeyCode[normalized] or Enum.KeyCode.RightControl
 end
 
 --================================================================--
---            LEGACY UI ADAPTER (Obsidian wrapper)                --
---   Bridges the old section/tab API onto Obsidian's groupboxes   --
+--                          SCHEDULER                             --
 --================================================================--
 
-local function createLegacyUiAdapter(baseLib, themeManager, saveManager)
+local Scheduler = {}
+do
+    local intervalTasks = {}
+    local renderTasks = {}
+    local reported = {}
+
+    local function runTask(entry, elapsed)
+        local ok, err = pcall(entry.fn, elapsed)
+        if not ok and not reported[entry.name] then
+            reported[entry.name] = true
+            warn(("[LeatherHub] task '%s' errored and will be reported once: %s"):format(entry.name, tostring(err)))
+        end
+    end
+
+    local function makeHandle(list, entry)
+        local handle = {}
+
+        function handle.stop()
+            for index = #list, 1, -1 do
+                if list[index] == entry then
+                    table.remove(list, index)
+                end
+            end
+        end
+
+        return handle
+    end
+
+    function Scheduler.every(name, interval, fn)
+        local entry = { name = name, interval = interval or 0, fn = fn, last = 0 }
+        table.insert(intervalTasks, entry)
+        return makeHandle(intervalTasks, entry)
+    end
+
+    function Scheduler.onHeartbeat(name, fn)
+        return Scheduler.every(name, 0, fn)
+    end
+
+    function Scheduler.onRender(name, fn)
+        local entry = { name = name, fn = fn }
+        table.insert(renderTasks, entry)
+        return makeHandle(renderTasks, entry)
+    end
+
+    Session.track(Services.RunService.Heartbeat:Connect(function()
+        local now = os.clock()
+        for index = #intervalTasks, 1, -1 do
+            local entry = intervalTasks[index]
+            if entry then
+                local elapsed = now - entry.last
+                if elapsed >= entry.interval then
+                    entry.last = now
+                    runTask(entry, elapsed)
+                end
+            end
+        end
+    end))
+
+    Session.track(Services.RunService.RenderStepped:Connect(function(dt)
+        for index = #renderTasks, 1, -1 do
+            local entry = renderTasks[index]
+            if entry then
+                runTask(entry, dt)
+            end
+        end
+    end))
+end
+
+--================================================================--
+--                            UTIL                                --
+--================================================================--
+
+local Util = {}
+do
+    local Players = Services.Players
+    local Workspace = Services.Workspace
+
+    local ZERO_VECTOR2 = Vector2.new(0, 0)
+
+    ----------------------------------------------------------------
+    -- Drawing
+    ----------------------------------------------------------------
+
+    local drawingStub = setmetatable({}, {
+        __index = function(_, key)
+            if key == "Remove" or key == "Destroy" then
+                return function() end
+            end
+            return nil
+        end,
+        __newindex = function() end,
+    })
+
+    local drawingAvailable = type(Drawing) == "table" and type(Drawing.new) == "function"
+
+    function Util.newDrawing(class, props)
+        if not drawingAvailable then
+            return drawingStub
+        end
+
+        local ok, object = pcall(Drawing.new, class)
+        if not ok or not object then
+            return drawingStub
+        end
+
+        for key, value in pairs(props or {}) do
+            pcall(function()
+                object[key] = value
+            end)
+        end
+
+        return object
+    end
+
+    function Util.drawingFont(name, fallback)
+        local fonts = drawingAvailable and Drawing.Fonts or nil
+        return (fonts and fonts[name]) or fallback or 0
+    end
+
+    ----------------------------------------------------------------
+    -- Screen space
+    ----------------------------------------------------------------
+
+    function Util.worldToScreen(position)
+        if type(WorldToScreen) == "function" then
+            local ok, point, onScreen = pcall(WorldToScreen, position)
+            if ok and point then
+                return Vector2.new(point.X, point.Y), onScreen == true
+            end
+        end
+
+        local camera = Workspace.CurrentCamera
+        if not camera then
+            return ZERO_VECTOR2, false
+        end
+
+        local point, onScreen = camera:WorldToViewportPoint(position)
+        return Vector2.new(point.X, point.Y), onScreen
+    end
+
+    function Util.getMousePosition()
+        local ok, position = pcall(function()
+            return Services.UserInputService:GetMouseLocation()
+        end)
+        if ok and position then
+            return position
+        end
+        return ZERO_VECTOR2
+    end
+
+    function Util.getMouseScreenPosition()
+        local position = Util.getMousePosition()
+        local ok, inset = pcall(function()
+            return Services.GuiService:GetGuiInset()
+        end)
+        if ok and inset then
+            return position + inset
+        end
+        return position
+    end
+
+    function Util.lerpColor(from, to, alpha)
+        return Color3.new(
+            from.R + (to.R - from.R) * alpha,
+            from.G + (to.G - from.G) * alpha,
+            from.B + (to.B - from.B) * alpha
+        )
+    end
+
+    ----------------------------------------------------------------
+    -- Character
+    ----------------------------------------------------------------
+
+    local cachedCharacter, cachedRoot
+
+    function Util.getHRP()
+        local character = LocalPlayer.Character
+        if not character or not character.Parent then
+            cachedCharacter, cachedRoot = nil, nil
+            return nil
+        end
+
+        if cachedCharacter ~= character or not cachedRoot or cachedRoot.Parent ~= character then
+            cachedCharacter = character
+            cachedRoot = character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart
+        end
+
+        return cachedRoot
+    end
+
+    function Util.getPlayerHRP(player)
+        local character = player and player.Character
+        return character and character:FindFirstChild("HumanoidRootPart") or nil
+    end
+
+    function Util.isAlive(player)
+        local character = (player or LocalPlayer).Character
+        if not character then
+            return false
+        end
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        return humanoid ~= nil and humanoid.Health > 0
+    end
+
+    ----------------------------------------------------------------
+    -- Roles
+    ----------------------------------------------------------------
+
+    function Util.hasTool(container, toolName)
+        if not container then
+            return false
+        end
+        for _, item in ipairs(container:GetChildren()) do
+            if item:IsA("Tool") and item.Name == toolName then
+                return true
+            end
+        end
+        return false
+    end
+
+    function Util.playerHasTool(player, toolName)
+        if not player then
+            return false
+        end
+        return Util.hasTool(player.Character, toolName)
+            or Util.hasTool(player:FindFirstChildOfClass("Backpack"), toolName)
+    end
+
+    function Util.getPlayerRole(player)
+        if Util.playerHasTool(player, "Knife") then
+            return "Murderer"
+        end
+        if Util.playerHasTool(player, "Gun") then
+            return "Sheriff"
+        end
+        return "Innocent"
+    end
+
+    function Util.findPlayerWithTool(toolName)
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer and Util.isAlive(player) and Util.playerHasTool(player, toolName) then
+                local root = Util.getPlayerHRP(player)
+                if root then
+                    return player, root
+                end
+            end
+        end
+        return nil, nil
+    end
+
+    ----------------------------------------------------------------
+    -- Map lookups
+    ----------------------------------------------------------------
+
+    function Util.findGunDrop()
+        local direct = Workspace:FindFirstChild("GunDrop")
+        if direct and direct:IsA("BasePart") then
+            return direct
+        end
+
+        for _, child in ipairs(Workspace:GetChildren()) do
+            if (child:IsA("Model") or child:IsA("Folder")) and not child:FindFirstChild("Humanoid") then
+                local drop = child:FindFirstChild("GunDrop")
+                if drop and drop:IsA("BasePart") then
+                    return drop
+                end
+
+                if child.Name == "Normal" then
+                    for _, map in ipairs(child:GetChildren()) do
+                        local mapDrop = map:FindFirstChild("GunDrop")
+                        if mapDrop and mapDrop:IsA("BasePart") then
+                            return mapDrop
+                        end
+                    end
+                end
+            end
+        end
+
+        return nil
+    end
+
+    function Util.findCoinContainer()
+        for _, child in ipairs(Workspace:GetChildren()) do
+            local container = child:FindFirstChild("CoinContainer")
+            if container then
+                return container
+            end
+        end
+
+        local normal = Workspace:FindFirstChild("Normal")
+        if normal then
+            for _, child in ipairs(normal:GetChildren()) do
+                local container = child:FindFirstChild("CoinContainer")
+                if container then
+                    return container
+                end
+            end
+            return normal:FindFirstChild("CoinContainer")
+        end
+
+        return nil
+    end
+
+    ----------------------------------------------------------------
+    -- Text
+    ----------------------------------------------------------------
+
+    function Util.comma(value)
+        local number = math.floor(tonumber(value) or 0)
+        local sign = ""
+        if number < 0 then
+            sign = "-"
+            number = -number
+        end
+
+        local text = tostring(number)
+        while true do
+            local replacements
+            text, replacements = text:gsub("^(%d+)(%d%d%d)", "%1,%2")
+            if replacements == 0 then
+                break
+            end
+        end
+
+        return sign .. text
+    end
+
+    function Util.cleanString(value)
+        return (tostring(value):lower():gsub("[^%w]", ""))
+    end
+
+    function Util.toKeyCode(key)
+        if typeof(key) == "EnumItem" then
+            return key
+        end
+        if type(key) ~= "string" then
+            return Enum.KeyCode.RightControl
+        end
+        return Enum.KeyCode[(key:gsub("%s+", ""))] or Enum.KeyCode.RightControl
+    end
+
+    function Util.tapKey(virtualKey)
+        pcall(keypress, virtualKey)
+        task.wait(0.02)
+        pcall(keyrelease, virtualKey)
+    end
+
+    function Util.clickMouse()
+        pcall(function()
+            mouse1click()
+        end)
+    end
+
+    function Util.isMouse1Down()
+        if type(ismouse1pressed) ~= "function" then
+            return false
+        end
+        local ok, pressed = pcall(ismouse1pressed)
+        return ok and pressed == true
+    end
+
+    function Util.isKeyDown(virtualKey, keyCode)
+        if type(iskeypressed) == "function" then
+            local ok, pressed = pcall(iskeypressed, virtualKey)
+            if ok then
+                return pressed == true
+            end
+        end
+        return Services.UserInputService:IsKeyDown(keyCode)
+    end
+end
+
+--================================================================--
+--                      MODULE REGISTRY                           --
+--================================================================--
+
+local Modules = {}
+local moduleOrder = {}
+
+local function defineModule(name, factory)
+    Modules[name] = factory
+    table.insert(moduleOrder, name)
+end
+
+--================================================================--
+--            MODULE: UI (Obsidian loader + legacy adapter)       --
+--================================================================--
+
+defineModule("ui", function(Ctx)
+    local function safeLoad(url)
+        -- Network + loadstring: the reason pcall exists.
+        local ok, loaded = pcall(function()
+            return loadstring(game:HttpGet(url))()
+        end)
+        return ok and loaded or nil
+    end
+
+    local ObsidianLib = safeLoad(OBSIDIAN_REPO .. "Library.lua")
+    if not ObsidianLib then
+        error("failed to load the Obsidian UI library", 0)
+    end
+
+    local ThemeManager = safeLoad(OBSIDIAN_REPO .. "addons/ThemeManager.lua")
+    local SaveManager = safeLoad(OBSIDIAN_REPO .. "addons/SaveManager.lua")
+
+    ----------------------------------------------------------------
+    -- Legacy adapter: bridges the old section/tab API used by the
+    -- feature modules onto Obsidian's groupboxes.
+    ----------------------------------------------------------------
+
     local uiIdCounter = 0
-    local pendingTheme = nil
-    local pendingCornerRadius = nil
+    local pendingTheme, pendingCornerRadius
 
     local function nextId(prefix, text)
         uiIdCounter = uiIdCounter + 1
@@ -170,19 +579,18 @@ local function createLegacyUiAdapter(baseLib, themeManager, saveManager)
 
         function section:Label(text)
             local label = groupbox:AddLabel(tostring(text or ""))
-            local state = {
-                text = tostring(text or ""),
-                color = nil
-            }
-
+            local state = { text = tostring(text or ""), color = nil }
             local wrapped = {}
 
             local function refreshLabel()
                 if state.color then
-                    local r = math.floor((state.color.R * 255) + 0.5)
-                    local g = math.floor((state.color.G * 255) + 0.5)
-                    local b = math.floor((state.color.B * 255) + 0.5)
-                    label:SetText(string.format('<font color="rgb(%d,%d,%d)">%s</font>', r, g, b, state.text))
+                    label:SetText(string.format(
+                        '<font color="rgb(%d,%d,%d)">%s</font>',
+                        math.floor((state.color.R * 255) + 0.5),
+                        math.floor((state.color.G * 255) + 0.5),
+                        math.floor((state.color.B * 255) + 0.5),
+                        state.text
+                    ))
                 else
                     label:SetText(state.text)
                 end
@@ -221,15 +629,14 @@ local function createLegacyUiAdapter(baseLib, themeManager, saveManager)
                     if callback then
                         callback(state)
                     end
-                end
+                end,
             })
 
             local wrapped = {}
 
             function wrapped:AddKeybind(key, mode, bindCallback)
-                local keyName = type(key) == "string" and key:upper() or "NONE"
                 return toggle:AddKeyPicker(nextId("keybind", text), {
-                    Default = keyName,
+                    Default = type(key) == "string" and key:upper() or "NONE",
                     Mode = mode or "Hold",
                     Text = tostring(text or "Keybind"),
                     SyncToggleState = false,
@@ -237,7 +644,7 @@ local function createLegacyUiAdapter(baseLib, themeManager, saveManager)
                         if bindCallback then
                             bindCallback(active)
                         end
-                    end
+                    end,
                 })
             end
 
@@ -257,7 +664,7 @@ local function createLegacyUiAdapter(baseLib, themeManager, saveManager)
                     if callback then
                         callback(color)
                     end
-                end
+                end,
             })
         end
 
@@ -273,7 +680,7 @@ local function createLegacyUiAdapter(baseLib, themeManager, saveManager)
                     if callback then
                         callback(value)
                     end
-                end
+                end,
             })
         end
 
@@ -285,7 +692,7 @@ local function createLegacyUiAdapter(baseLib, themeManager, saveManager)
                     if callback then
                         callback(value)
                     end
-                end
+                end,
             })
         end
 
@@ -311,21 +718,18 @@ local function createLegacyUiAdapter(baseLib, themeManager, saveManager)
                 Tooltip = tooltip,
                 Searchable = searchable == true,
                 Callback = function(value)
-                    if callback then
-                        if isMulti then
-                            callback(toSelectedList(value, dropdownValues))
-                        else
-                            callback(normalizeSingle(value, dropdownValues))
-                        end
+                    if not callback then
+                        return
                     end
-                end
+                    if isMulti then
+                        callback(toSelectedList(value, dropdownValues))
+                    else
+                        callback(normalizeSingle(value, dropdownValues))
+                    end
+                end,
             })
 
-            local wrapped = {
-                _dropdown = dropdown,
-                _values = dropdownValues,
-                _multi = isMulti
-            }
+            local wrapped = { _dropdown = dropdown, _values = dropdownValues, _multi = isMulti }
 
             function wrapped:Get()
                 local current = wrapped._dropdown.Value
@@ -359,9 +763,9 @@ local function createLegacyUiAdapter(baseLib, themeManager, saveManager)
             end
 
             function wrapped:RemoveChoice(choice)
-                for i = #wrapped._values, 1, -1 do
-                    if wrapped._values[i] == choice then
-                        table.remove(wrapped._values, i)
+                for index = #wrapped._values, 1, -1 do
+                    if wrapped._values[index] == choice then
+                        table.remove(wrapped._values, index)
                     end
                 end
 
@@ -369,9 +773,9 @@ local function createLegacyUiAdapter(baseLib, themeManager, saveManager)
 
                 if wrapped._multi then
                     local selected = wrapped:Get()
-                    for i = #selected, 1, -1 do
-                        if selected[i] == choice then
-                            table.remove(selected, i)
+                    for index = #selected, 1, -1 do
+                        if selected[index] == choice then
+                            table.remove(selected, index)
                         end
                     end
                     wrapped:Set(selected)
@@ -391,16 +795,10 @@ local function createLegacyUiAdapter(baseLib, themeManager, saveManager)
 
         function wrappedTab:Section(name, side)
             local title = tostring(name or "Section")
-            local placement = tostring(side or "Left")
-            local groupbox
-
-            if placement == "Right" then
-                groupbox = tab:AddRightGroupbox(title)
-            else
-                groupbox = tab:AddLeftGroupbox(title)
+            if tostring(side or "Left") == "Right" then
+                return createSectionWrapper(tab:AddRightGroupbox(title))
             end
-
-            return createSectionWrapper(groupbox)
+            return createSectionWrapper(tab:AddLeftGroupbox(title))
         end
 
         return wrappedTab
@@ -409,22 +807,22 @@ local function createLegacyUiAdapter(baseLib, themeManager, saveManager)
     local function configureSettingsTab(window, icon)
         local settingsTab = window:AddTab("UI Settings", icon or "settings")
 
-        if themeManager then
+        if ThemeManager then
             pcall(function()
-                themeManager:SetLibrary(baseLib)
-                themeManager:SetFolder("LeatherHubMM2")
-                themeManager:ApplyToTab(settingsTab, "palette")
-                themeManager:LoadDefault()
+                ThemeManager:SetLibrary(ObsidianLib)
+                ThemeManager:SetFolder("LeatherHubMM2")
+                ThemeManager:ApplyToTab(settingsTab, "palette")
+                ThemeManager:LoadDefault()
             end)
         end
 
-        if saveManager then
+        if SaveManager then
             pcall(function()
-                saveManager:SetLibrary(baseLib)
-                saveManager:IgnoreThemeSettings()
-                saveManager:SetFolder("LeatherHubMM2")
-                saveManager:BuildConfigSection(settingsTab, "save")
-                saveManager:LoadAutoloadConfig()
+                SaveManager:SetLibrary(ObsidianLib)
+                SaveManager:IgnoreThemeSettings()
+                SaveManager:SetFolder("LeatherHubMM2")
+                SaveManager:BuildConfigSection(settingsTab, "save")
+                SaveManager:LoadAutoloadConfig()
             end)
         end
 
@@ -437,20 +835,18 @@ local function createLegacyUiAdapter(baseLib, themeManager, saveManager)
         pendingTheme = theme
     end
 
-    function adapter:SetBackgroundEffect(_effect)
-    end
+    function adapter:SetBackgroundEffect(_effect) end
 
     function adapter:SetRounding(rounding)
         pendingCornerRadius = tonumber(rounding) or pendingCornerRadius
     end
 
-    function adapter:SetRowLines(_enabled)
-    end
+    function adapter:SetRowLines(_enabled) end
 
     function adapter:CreateWindow(options)
         local windowOptions = options or {}
         local size = windowOptions.size
-        local mappedSize = nil
+        local mappedSize
 
         if typeof(size) == "Vector2" then
             mappedSize = UDim2.fromOffset(size.X, size.Y)
@@ -458,10 +854,6 @@ local function createLegacyUiAdapter(baseLib, themeManager, saveManager)
             mappedSize = size
         end
 
-        -- Obsidian's Icon option accepts Lucide icon names or Roblox
-        -- asset ids, but not raw http(s) URLs. Remote logos are
-        -- downloaded and converted into a local custom asset so the
-        -- image renders next to the window title.
         local logo = windowOptions.logo or windowOptions.Icon
         local icon = logo
         if type(icon) == "string" and icon:match("^https?://") then
@@ -481,20 +873,20 @@ local function createLegacyUiAdapter(baseLib, themeManager, saveManager)
             end
         end
 
-        local window = baseLib:CreateWindow({
+        local window = ObsidianLib:CreateWindow({
             Title = windowOptions.title or windowOptions.Title or "LeatherHub MM2",
             Footer = windowOptions.subtitle or windowOptions.Footer or "",
             Icon = icon,
             Size = mappedSize,
             CornerRadius = pendingCornerRadius or windowOptions.CornerRadius,
-            ToggleKeybind = toKeyCode(windowOptions.menuKey or windowOptions.ToggleKeybind),
-            NotifySide = "Right"
+            ToggleKeybind = Util.toKeyCode(windowOptions.menuKey or windowOptions.ToggleKeybind),
+            NotifySide = "Right",
         })
 
-        if pendingTheme and themeManager then
+        if pendingTheme and ThemeManager then
             pcall(function()
-                themeManager:SetLibrary(baseLib)
-                themeManager:ApplyTheme(pendingTheme)
+                ThemeManager:SetLibrary(ObsidianLib)
+                ThemeManager:ApplyTheme(pendingTheme)
             end)
         end
 
@@ -516,1500 +908,1376 @@ local function createLegacyUiAdapter(baseLib, themeManager, saveManager)
             success = "check",
             error = "triangle-alert",
             warning = "alert-triangle",
-            info = "info"
+            info = "info",
         }
 
         if description == nil then
-            baseLib:Notify(tostring(title or ""), tonumber(duration) or 4)
+            ObsidianLib:Notify(tostring(title or ""), tonumber(duration) or 4)
             return
         end
 
-        baseLib:Notify({
+        ObsidianLib:Notify({
             Title = tostring(title or "Notice"),
             Description = tostring(description or ""),
             Time = tonumber(duration) or 4,
-            Icon = iconByKind[kind]
+            Icon = iconByKind[kind],
         })
     end
 
-    return adapter
-end
+    ----------------------------------------------------------------
+    -- Window + tabs
+    ----------------------------------------------------------------
 
---================================================================--
---                   LIBRARY INSTANCE & UTILS                     --
---================================================================--
+    adapter:ApplyThemePreset("Default")
+    adapter:SetRounding(0)
+    adapter:SetRowLines(true)
 
-local Lib = createLegacyUiAdapter(ObsidianLib, ThemeManager, SaveManager)
-local function notify(text, title, duration)
-    Lib:Notify(title or "Notification", text or "", duration or 3)
-end
+    local window = adapter:CreateWindow({
+        title = "LeatherHub MM2",
+        subtitle = "MenuKey: Right Alt | Discord.gg/kQs7zvTwnX",
+        logo = LOGO_URL,
+        logoSize = 32,
+        size = Vector2.new(950, 650),
+        menuKey = "RightAlt",
+        autoSave = false,
+        smartFps = false,
+    })
 
-local function getMouse()
-    local ok, pos = pcall(function()
-        return UserInputService:GetMouseLocation()
-    end)
+    Ctx.Lib = adapter
+    Ctx.window = window
 
-    if ok and pos then
-        local inset = GuiService and GuiService:GetGuiInset() or Vector2.new(0, 0)
-        return { X = pos.X - inset.X, Y = pos.Y - inset.Y }
+    function Ctx.notify(text, title, duration)
+        adapter:Notify(title or "Notification", text or "", duration or 3)
     end
 
-    return { X = 0, Y = 0 }
-end
-
-local LocalPlayer = Players.LocalPlayer
-
---================================================================--
---                  ROUND TIMER (Drawing setup)                   --
---================================================================--
-
-local RoundTimerEnabled = false
-local TimerLabel = Drawing.new("Text")
-TimerLabel.Visible = false
-TimerLabel.Center = true
-TimerLabel.Outline = true
-TimerLabel.Font = 6 -- UI
-TimerLabel.Size = 28
-TimerLabel.Color = Color3.fromRGB(255, 215, 0)
-TimerLabel.Position = Vector2.new(500, 20) -- Will be updated in Heartbeat
-
-pcall(function()
-    local cam = workspace.CurrentCamera
-    if cam then
-        TimerLabel.Position = Vector2.new(cam.ViewportSize.X / 2, 20)
-    end
+    Ctx.tabs = {
+        trade = window:Tab("Trade Checker", "swords"),
+        values = window:Tab("Item Values", "search"),
+        combat = window:Tab("Combat", "swords"),
+        visuals = window:Tab("Visuals", "eye"),
+        misc = window:Tab("Misc", "shield"),
+        farm = window:Tab("Auto Farm", "zap"),
+    }
 end)
 
 --================================================================--
---                       WINDOW CREATION                          --
+--                 MODULE: ITEM VALUES (API + tab)                --
 --================================================================--
 
-Lib:ApplyThemePreset("Default")
-Lib:SetRounding(0)
-Lib:SetRowLines(true)
+defineModule("values", function(Ctx)
+    local Lib = Ctx.Lib
+    local cleanString = Util.cleanString
 
-local win = Lib:CreateWindow({
-    title = "LeatherHub MM2",
-    subtitle = "MenuKey: Right Alt | Discord.gg/kQs7zvTwnX",
-    logo = "https://raw.githubusercontent.com/qisery/mm2/main/moto1.jpg",
-    logoSize = 32,
-    size = Vector2 and Vector2.new(950, 650) or nil,
-    menuKey = "RightAlt",
-    autoSave = false,
-    smartFps = false
-})
+    Lib:Notify("Loading...", "Fetching values from server, please wait.", 3)
 
---================================================================--
---               ITEM VALUES API (fetch & index)                  --
---================================================================--
-
-Lib:Notify("Loading...", "Fetching values from server, please wait.", 3)
-
-local success, response = pcall(function()
-    return game:HttpGet(API_URL)
-end)
-
-if not success or not response then
-    Lib:Notify("Error!", "Could not reach API.", 5, "error")
-    return
-end
-
-local decodedData = HttpService:JSONDecode(response)
-local allItems = decodedData.items
-
-local groupedItems = {}
-local dropdownOptions = {}
-local itemValuesMap = {}
-local cleanNameToFullText = {}
-
-for _, item in ipairs(allItems) do
-    if item.name == "Ice Wing" then
-        item.name = "Icewing"
-    elseif item.name == "Gold Edlerwood Blade" then
-        item.name = "Gold Elderwood Blade"
-    end
-
-    local cat = item.category
-    if not groupedItems[cat] then
-        groupedItems[cat] = {}
-    end
-    table.insert(groupedItems[cat], item)
-
-    local valStr = tostring(item.value):gsub(",", "")
-    local valNum = tonumber(valStr) or 0
-
-    local dropText = item.name .. " [Val: " .. item.value .. "]"
-    itemValuesMap[dropText] = valNum
-    local cleaned = item.name:lower():gsub("[^%w]", "")
-    if not cleanNameToFullText[cleaned] or valNum > (itemValuesMap[cleanNameToFullText[cleaned]] or 0) then
-        cleanNameToFullText[cleaned] = dropText
-    end
-    table.insert(dropdownOptions, dropText)
-end
-
-table.sort(dropdownOptions, function(a, b)
-    local valA = itemValuesMap[a] or 0
-    local valB = itemValuesMap[b] or 0
-    if valA == valB then
-        return a < b
-    end
-    return valA > valB
-end)
-
-local function addItemToSection(section, item)
-    local text = string.format("%s | Value: %s | Demand: %s | Stability: %s",
-        item.name, item.value, item.demand, item.stability)
-
-    section:Button(text, function()
-        Lib:Notify(item.name, "Value: " .. item.value .. "\nPress Ctrl+C to copy", 3)
+    -- Remote HTTP: expected to fail sometimes.
+    local ok, response = pcall(function()
+        return game:HttpGet(API_URL)
     end)
-end
 
---================================================================--
---                    TAB: TRADE CHECKER                          --
---================================================================--
--- Reads the live MM2 trade window and scores the trade in real time.
---
--- NOTE: this whole tab is wrapped in a do...end block on purpose. The
--- main chunk sits at Luau's hard ceiling of 200 locals, so anything
--- declared at top level here would break the entire script. Scoping the
--- tab frees its locals at the end of the block instead of holding them
--- to end of file.
-
-do
-
-local tradeTab = win:Tab("Trade Checker", "swords")
-
-local yourSec = tradeTab:Section("Your Offer", "Left")
-local theirSec = tradeTab:Section("Their Offer", "Right")
-local resSec = tradeTab:Section("Result", "Full")
-
-local MAX_SLOTS = 4 -- MM2 trades are hard-capped at 4 items per side
-
-local yourTotal = 0
-local theirTotal = 0
-
-local yourValLabel = yourSec:Label("Total Value: 0")
-local yourSlotLabels = {}
-for i = 1, MAX_SLOTS do
-    yourSlotLabels[i] = yourSec:Label("")
-end
-
-local theirValLabel = theirSec:Label("Total Value: 0")
-local theirSlotLabels = {}
-for i = 1, MAX_SLOTS do
-    theirSlotLabels[i] = theirSec:Label("")
-end
-
-local liveStatusLabel = resSec:Label("Live Mode: waiting for a trade to open...")
-local livePartnerLabel = resSec:Label("Trading with: -")
-local finalResLabel = resSec:Label("Status: Waiting for items...")
-
---================================================================--
---                     LIVE TRADE PLUMBING                        --
---================================================================--
-
-local TradeRemotes = game:GetService("ReplicatedStorage"):WaitForChild("Trade")
-local TradeGUI = LocalPlayer:WaitForChild("PlayerGui"):WaitForChild("TradeGUI")
-
--- Sync is the item database: Sync.Item == Sync.Weapons, plus Sync.Pets.
--- Records look like { ItemName = "Seer", Rarity = "Godly", Chroma = true }.
-local Sync
-do
-    local ok, mod = pcall(function()
-        return require(game:GetService("ReplicatedStorage"):WaitForChild("Database"):WaitForChild("Sync"))
-    end)
-    Sync = ok and mod or nil
-end
-
-local liveMode = true      -- toggle
-local tradeOpen = false     -- TradeGUI.Enabled
-local haveEvent = false     -- an UpdateTrade payload arrived for this trade
-local livePartner = ""
-
-local liveYourItems, liveYourTotal, liveYourUnpriced = {}, 0, 0
-local liveTheirItems, liveTheirTotal, liveTheirUnpriced = {}, 0, 0
-
--- In-game overlay state. updateOverlay is filled in further down, once the
--- connection bookkeeping exists; recompute() only calls it if it is there.
-local overlayEnabled = true
-local overlayTags = true
-local updateOverlay
-
-local function comma(n)
-    local neg = ""
-    n = math.floor(tonumber(n) or 0)
-    if n < 0 then neg = "-"; n = -n end
-    local s = tostring(n)
-    while true do
-        local k
-        s, k = s:gsub("^(%d+)(%d%d%d)", "%1,%2")
-        if k == 0 then break end
-    end
-    return neg .. s
-end
-
-local function cleanString(str)
-    return (tostring(str):lower():gsub("[^%w]", ""))
-end
-
-local function findFullItemName(cleanName)
-    return cleanNameToFullText[cleanString(cleanName)]
-end
-
--- Returns nil (not 0) when the item isn't in the API list, so unpriced
--- items can be flagged rather than silently counted as worthless.
-local function lookupValue(name)
-    local fullText = cleanNameToFullText[cleanString(name)]
-    if not fullText then return nil end
-    return itemValuesMap[fullText] or 0
-end
-
--- Chroma weapons store ItemName WITHOUT the word "Chroma" (SeerChroma ->
--- "Seer"), but the record carries an explicit Chroma flag. Trust the flag:
--- "Chroma Seer" then cleans to "chromaseer", which is how the API names it.
-local function displayNameFor(itemId, itemType)
-    local rec
-    if Sync then
-        if itemType and Sync[itemType] then
-            rec = Sync[itemType][itemId]
-        end
-        if not rec then
-            rec = (Sync.Item and Sync.Item[itemId]) or (Sync.Pets and Sync.Pets[itemId])
-        end
-    end
-    if not rec then return tostring(itemId) end
-
-    local base = rec.ItemName or rec.Name or tostring(itemId)
-    if rec.Chroma and not tostring(base):lower():find("chroma", 1, true) then
-        base = "Chroma " .. base
-    end
-    return base
-end
-
--- Offer entries are { ItemID, Amount, ItemType }, positional or named.
-local function buildFromOffer(offerTable)
-    local items, total, unpriced = {}, 0, 0
-    if type(offerTable) ~= "table" then return items, total, unpriced end
-
-    for _, entry in pairs(offerTable) do
-        if type(entry) == "table" then
-            local itemId = entry[1] or entry.ItemID
-            local amount = tonumber(entry[2] or entry.Amount) or 1
-            local itemType = entry[3] or entry.ItemType
-            if itemId then
-                local name = displayNameFor(itemId, itemType)
-                local val = lookupValue(name)
-                if val then
-                    total = total + (val * amount)
-                else
-                    unpriced = unpriced + 1
-                end
-                table.insert(items, { name = name, qty = amount, value = val })
-            end
-        end
-    end
-    return items, total, unpriced
-end
-
--- The visible trade window itself. Also the anchor the in-game overlay
--- pins itself to, so both readers agree on what "the trade" is.
-local function getTradeFrame()
-    local cont = TradeGUI:FindFirstChild("Container")
-    return cont and cont:FindFirstChild("Trade")
-end
-
--- Reads one NewItem slot straight off the trade window. Returns nil for
--- empty or still-loading slots. Used both by the UI fallback below and by
--- the overlay, which needs values per slot rather than per offer.
-local function readSlotItem(slot)
-    if not (slot and slot.Visible) then return nil end
-
-    local nameFrame = slot:FindFirstChild("ItemName")
-    local label = nameFrame and nameFrame:FindFirstChild("Label")
-    if not (label and label:IsA("TextLabel")) then return nil end
-
-    local name = ((label.Text or ""):gsub("<[^>]+>", "")):match("^%s*(.-)%s*$")
-    local lower = name:lower()
-    if name == "" or lower == "loading" or lower == "label" then return nil end
-
-    -- Each slot has a dedicated Chroma tag frame, which is far more
-    -- reliable than sniffing descendant names and images.
-    local tags = slot:FindFirstChild("Tags")
-    local chromaTag = tags and tags:FindFirstChild("Chroma")
-    if chromaTag and chromaTag:IsA("GuiObject") and chromaTag.Visible
-        and not lower:find("chroma", 1, true) then
-        name = "Chroma " .. name
+    local decoded
+    if ok and response then
+        ok, decoded = pcall(function()
+            return Services.HttpService:JSONDecode(response)
+        end)
     end
 
-    local qty = 1
-    local slotCont = slot:FindFirstChild("Container")
-    local amtLabel = slotCont and slotCont:FindFirstChild("Amount")
-    if amtLabel and amtLabel:IsA("TextLabel") then
-        qty = tonumber((amtLabel.Text or ""):match("x%s*(%d+)")) or 1
-    end
-
-    return { name = name, qty = qty, value = lookupValue(name) }
-end
-
--- Fallback used only until the first UpdateTrade fires, i.e. when the
--- script is executed while a trade is already open.
-local function buildFromUI(offerFrame)
-    local items, total, unpriced = {}, 0, 0
-    local cont = offerFrame and offerFrame:FindFirstChild("Container")
-    if not cont then return items, total, unpriced end
-
-    for i = 1, MAX_SLOTS do
-        local item = readSlotItem(cont:FindFirstChild("NewItem" .. i))
-        if item then
-            if item.value then
-                total = total + (item.value * item.qty)
-            else
-                unpriced = unpriced + 1
-            end
-            table.insert(items, item)
-        end
-    end
-    return items, total, unpriced
-end
-
---================================================================--
---                         RENDERING                              --
---================================================================--
-
-local function liveActive()
-    return liveMode and tradeOpen
-end
-
-local function renderSlots(labels, items)
-    for i = 1, MAX_SLOTS do
-        local it = items[i]
-        if it then
-            local qtyStr = it.qty > 1 and (" x" .. tostring(it.qty)) or ""
-            if it.value then
-                labels[i]:SetText(it.name .. qtyStr .. " - " .. comma(it.value * it.qty))
-                labels[i]:SetColor(Color3.fromRGB(220, 220, 220))
-            else
-                labels[i]:SetText(it.name .. qtyStr .. " - [no value listed]")
-                labels[i]:SetColor(Color3.fromRGB(255, 180, 60))
-            end
-        else
-            labels[i]:SetText("")
-        end
-    end
-end
-
-local function updateResult()
-    if yourTotal == 0 and theirTotal == 0 then
-        finalResLabel:SetText("Status: Waiting for items...")
-        finalResLabel:SetColor(Color3.fromRGB(200, 200, 200))
-    elseif yourTotal > theirTotal then
-        local loss = yourTotal - theirTotal
-        finalResLabel:SetText("YOU LOSE! (Loss: " .. comma(loss) .. ")")
-        finalResLabel:SetColor(Color3.fromRGB(255, 50, 50))
-    elseif theirTotal > yourTotal then
-        local profit = theirTotal - yourTotal
-        finalResLabel:SetText("YOU WIN! (Profit: " .. comma(profit) .. ")")
-        finalResLabel:SetColor(Color3.fromRGB(50, 255, 50))
-    else
-        finalResLabel:SetText("FAIR TRADE! (Equal Value)")
-        finalResLabel:SetColor(Color3.fromRGB(255, 255, 255))
-    end
-end
-
-local yourSelectedInv = {}
-local yourSelectedAll = {}
-local theirSelected = {}
-
-local function sumManual(list)
-    local total = 0
-    for _, dropText in ipairs(list) do
-        local cleanDropText = dropText:gsub("%s*%(x%d+%)", "")
-        local qty = tonumber(dropText:match("%(x(%d+)%)")) or 1
-        total = total + ((itemValuesMap[cleanDropText] or 0) * qty)
-    end
-    return total
-end
-
--- Single entry point for every recalculation. While a trade is open the
--- live offers drive the totals and the manual lists are ignored, so the
--- two sources can never be double counted.
-local function recompute()
-    if liveActive() then
-        yourTotal = liveYourTotal
-        theirTotal = liveTheirTotal
-
-        renderSlots(yourSlotLabels, liveYourItems)
-        renderSlots(theirSlotLabels, liveTheirItems)
-
-        local yourSuffix = liveYourUnpriced > 0 and (" (" .. liveYourUnpriced .. " unpriced)") or ""
-        local theirSuffix = liveTheirUnpriced > 0 and (" (" .. liveTheirUnpriced .. " unpriced)") or ""
-        yourValLabel:SetText("Total Value: " .. comma(yourTotal) .. yourSuffix)
-        theirValLabel:SetText("Total Value: " .. comma(theirTotal) .. theirSuffix)
-
-        liveStatusLabel:SetText("Live Mode: reading " .. (haveEvent and "trade data" or "trade window") .. " (manual lists ignored)")
-        liveStatusLabel:SetColor(Color3.fromRGB(50, 255, 50))
-        livePartnerLabel:SetText("Trading with: " .. (livePartner ~= "" and livePartner or "-"))
-    else
-        yourTotal = sumManual(yourSelectedInv) + sumManual(yourSelectedAll)
-        theirTotal = sumManual(theirSelected)
-
-        renderSlots(yourSlotLabels, {})
-        renderSlots(theirSlotLabels, {})
-
-        yourValLabel:SetText("Total Value: " .. comma(yourTotal))
-        theirValLabel:SetText("Total Value: " .. comma(theirTotal))
-
-        if liveMode then
-            liveStatusLabel:SetText("Live Mode: waiting for a trade to open...")
-            liveStatusLabel:SetColor(Color3.fromRGB(200, 200, 200))
-        else
-            liveStatusLabel:SetText("Live Mode: OFF - using manual selections")
-            liveStatusLabel:SetColor(Color3.fromRGB(255, 180, 60))
-        end
-        livePartnerLabel:SetText("Trading with: -")
-    end
-
-    updateResult()
-
-    if updateOverlay then updateOverlay() end
-end
-
---================================================================--
---                       LIVE TRADE HOOKS                         --
---================================================================--
-
--- Re-running the script must not stack listeners or leave old loops alive.
-_G.__TradeCheckerGen = (_G.__TradeCheckerGen or 0) + 1
-local myGen = _G.__TradeCheckerGen
-
-if _G.__TradeCheckerConns then
-    for _, c in pairs(_G.__TradeCheckerConns) do
-        pcall(function() c:Disconnect() end)
-    end
-end
-_G.__TradeCheckerConns = {}
-
---================================================================--
---                   IN-GAME TRADE OVERLAY                        --
---================================================================--
--- Puts the checker on MM2's own trade window instead of only in the
--- menu: a value bar pinned to the trade frame, plus a value tag on every
--- filled item slot. The bar fills from the left with your share of the
--- pot, so the tick in the middle is the break-even point - fill short of
--- it means profit, past it means loss.
---
--- Nothing here is parented into the game's GUI; the overlay is its own
--- ScreenGui that tracks the trade window by AbsolutePosition, so MM2's
--- own trade code never sees an unexpected child.
-
-do
-
-local RunService = game:GetService("RunService")
-
-local PANEL_W_MIN, PANEL_W_MAX, PANEL_H, BAR_H, TAG_H = 280, 620, 80, 26, 18
-local COL_WIN = Color3.fromRGB(60, 220, 110)
-local COL_LOSE = Color3.fromRGB(240, 70, 70)
-local COL_FAIR = Color3.fromRGB(235, 235, 235)
-
-local function make(class, props, parent)
-    local inst = Instance.new(class)
-    for prop, value in pairs(props) do
-        inst[prop] = value
-    end
-    inst.Parent = parent
-    return inst
-end
-
--- Executors hide GUIs in different places; CoreGui is not always writable.
-local function overlayParent()
-    local ok, hidden = pcall(function() return gethui and gethui() end)
-    if ok and hidden then return hidden end
-    local okCore, core = pcall(function() return game:GetService("CoreGui") end)
-    if okCore and core then return core end
-    return LocalPlayer:WaitForChild("PlayerGui")
-end
-
-for _, place in ipairs({ overlayParent(), LocalPlayer:FindFirstChild("PlayerGui") }) do
-    local stale = place and place:FindFirstChild("LeatherHubTradeOverlay")
-    if stale then pcall(function() stale:Destroy() end) end
-end
-
-local screen = Instance.new("ScreenGui")
-screen.Name = "LeatherHubTradeOverlay"
-screen.ResetOnSpawn = false
-screen.DisplayOrder = 9999
-screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
-screen.IgnoreGuiInset = TradeGUI.IgnoreGuiInset
-screen.Enabled = false
-if not pcall(function() screen.Parent = overlayParent() end) then
-    screen.Parent = LocalPlayer:WaitForChild("PlayerGui")
-end
-pcall(function() if syn and syn.protect_gui then syn.protect_gui(screen) end end)
-
-local panel = make("Frame", {
-    Name = "Panel",
-    BackgroundColor3 = Color3.fromRGB(22, 22, 26),
-    BackgroundTransparency = 0.08,
-    BorderSizePixel = 0,
-    Size = UDim2.fromOffset(PANEL_W_MIN, PANEL_H),
-    Visible = false
-}, screen)
-make("UICorner", { CornerRadius = UDim.new(0, 8) }, panel)
-make("UIStroke", { Color = Color3.fromRGB(70, 70, 82), Thickness = 1, Transparency = 0.25 }, panel)
-
-local statusLabel = make("TextLabel", {
-    BackgroundTransparency = 1,
-    Position = UDim2.fromOffset(0, 6),
-    Size = UDim2.new(1, 0, 0, 20),
-    Font = Enum.Font.GothamBold,
-    TextSize = 16,
-    Text = "WAITING FOR ITEMS",
-    TextColor3 = COL_FAIR
-}, panel)
-
-local bar = make("Frame", {
-    BackgroundColor3 = Color3.fromRGB(44, 44, 52),
-    BorderSizePixel = 0,
-    Position = UDim2.new(0, 10, 0, 30),
-    Size = UDim2.new(1, -20, 0, BAR_H)
-}, panel)
-make("UICorner", { CornerRadius = UDim.new(0, 4) }, bar)
-
-local fill = make("Frame", {
-    BackgroundColor3 = COL_FAIR,
-    BorderSizePixel = 0,
-    Size = UDim2.new(0, 0, 1, 0),
-    ZIndex = 2
-}, bar)
-make("UICorner", { CornerRadius = UDim.new(0, 4) }, fill)
-
--- Break-even marker: your offer is worth exactly theirs when the fill
--- lands here.
-make("Frame", {
-    BackgroundColor3 = Color3.fromRGB(255, 255, 255),
-    BackgroundTransparency = 0.3,
-    BorderSizePixel = 0,
-    AnchorPoint = Vector2.new(0.5, 0),
-    Position = UDim2.new(0.5, 0, 0, 0),
-    Size = UDim2.new(0, 2, 1, 0),
-    ZIndex = 3
-}, bar)
-
-local yourBarLabel = make("TextLabel", {
-    BackgroundTransparency = 1,
-    Position = UDim2.new(0, 8, 0, 0),
-    Size = UDim2.new(0.5, -10, 1, 0),
-    Font = Enum.Font.GothamBold,
-    TextSize = 13,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    TextColor3 = Color3.fromRGB(255, 255, 255),
-    TextStrokeTransparency = 0.4,
-    Text = "YOU 0",
-    ZIndex = 4
-}, bar)
-
-local theirBarLabel = make("TextLabel", {
-    BackgroundTransparency = 1,
-    AnchorPoint = Vector2.new(1, 0),
-    Position = UDim2.new(1, -8, 0, 0),
-    Size = UDim2.new(0.5, -10, 1, 0),
-    Font = Enum.Font.GothamBold,
-    TextSize = 13,
-    TextXAlignment = Enum.TextXAlignment.Right,
-    TextColor3 = Color3.fromRGB(255, 255, 255),
-    TextStrokeTransparency = 0.4,
-    Text = "0 THEM",
-    ZIndex = 4
-}, bar)
-
-local detailLabel = make("TextLabel", {
-    BackgroundTransparency = 1,
-    Position = UDim2.new(0, 10, 0, 59),
-    Size = UDim2.new(1, -20, 0, 16),
-    Font = Enum.Font.Gotham,
-    TextSize = 12,
-    TextColor3 = Color3.fromRGB(185, 185, 195),
-    Text = ""
-}, panel)
-
--- One tag per slot per side, created up front and simply moved around.
-local SIDES = { { key = "your", frame = "YourOffer" }, { key = "their", frame = "TheirOffer" } }
-local slotTags = { your = {}, their = {} }
-local slotItems = { your = {}, their = {} }
-
-for _, side in ipairs(SIDES) do
-    for i = 1, MAX_SLOTS do
-        local tag = make("TextLabel", {
-            Name = side.key .. "Tag" .. i,
-            BackgroundColor3 = Color3.fromRGB(16, 16, 20),
-            BackgroundTransparency = 0.15,
-            BorderSizePixel = 0,
-            Font = Enum.Font.GothamBold,
-            TextSize = 12,
-            TextColor3 = COL_FAIR,
-            Text = "",
-            Visible = false,
-            ZIndex = 2
-        }, screen)
-        make("UICorner", { CornerRadius = UDim.new(0, 4) }, tag)
-        make("UIStroke", { Color = Color3.fromRGB(70, 70, 82), Thickness = 1, Transparency = 0.35 }, tag)
-        slotTags[side.key][i] = tag
-    end
-end
-
--- Panel contents. Driven by the live offers only: the manual dropdowns are
--- a menu-side planning tool and would be misleading pinned to a real trade.
-local function refreshPanel()
-    local pot = liveYourTotal + liveTheirTotal
-    local diff = liveTheirTotal - liveYourTotal
-    local colour, text
-
-    if pot == 0 then
-        colour, text = COL_FAIR, "WAITING FOR ITEMS"
-    elseif diff > 0 then
-        colour, text = COL_WIN, "YOU WIN  +" .. comma(diff)
-    elseif diff < 0 then
-        colour, text = COL_LOSE, "YOU LOSE  -" .. comma(-diff)
-    else
-        colour, text = COL_FAIR, "FAIR TRADE"
-    end
-
-    statusLabel.Text = text
-    statusLabel.TextColor3 = colour
-    fill.BackgroundColor3 = colour
-    fill.Size = UDim2.new(pot > 0 and (liveYourTotal / pot) or 0, 0, 1, 0)
-
-    yourBarLabel.Text = "YOU  " .. comma(liveYourTotal)
-    theirBarLabel.Text = comma(liveTheirTotal) .. "  THEM"
-
-    local unpriced = liveYourUnpriced + liveTheirUnpriced
-    local detail = "Trading with " .. (livePartner ~= "" and livePartner or "-")
-    if unpriced > 0 then
-        detail = detail .. "  |  " .. unpriced .. " item" .. (unpriced == 1 and "" or "s") .. " with no listed value"
-        detailLabel.TextColor3 = Color3.fromRGB(255, 180, 60)
-    else
-        detailLabel.TextColor3 = Color3.fromRGB(185, 185, 195)
-    end
-    detailLabel.Text = detail
-end
-
--- Re-reading eight slots every frame is wasteful; positions still need to
--- track the window frame by frame, so only the text is throttled.
-local lastRead = 0
-
-local function readSlots(trade)
-    for _, side in ipairs(SIDES) do
-        local cont = trade:FindFirstChild(side.frame)
-        cont = cont and cont:FindFirstChild("Container")
-        for i = 1, MAX_SLOTS do
-            local slot = cont and cont:FindFirstChild("NewItem" .. i)
-            local item = overlayTags and slot and readSlotItem(slot) or nil
-            slotItems[side.key][i] = item and slot or nil
-
-            local tag = slotTags[side.key][i]
-            if item then
-                if item.value then
-                    tag.Text = comma(item.value * item.qty)
-                    tag.TextColor3 = COL_FAIR
-                else
-                    tag.Text = "?"
-                    tag.TextColor3 = Color3.fromRGB(255, 180, 60)
-                end
-            end
-        end
-    end
-end
-
-local function layout()
-    local trade = getTradeFrame()
-    local show = overlayEnabled and TradeGUI.Enabled and trade ~= nil and trade.AbsoluteSize.X > 0
-    if screen.Enabled ~= show then screen.Enabled = show end
-    if not show then return end
-
-    -- Match the game's inset handling, otherwise AbsolutePosition and our
-    -- own offsets are measured from different origins.
-    if screen.IgnoreGuiInset ~= TradeGUI.IgnoreGuiInset then
-        screen.IgnoreGuiInset = TradeGUI.IgnoreGuiInset
-    end
-
-    local pos, size = trade.AbsolutePosition, trade.AbsoluteSize
-    local width = math.clamp(size.X, PANEL_W_MIN, PANEL_W_MAX)
-    local y = pos.Y - PANEL_H - 8
-    if y < 4 then y = pos.Y + 8 end -- no room above: sit inside the window
-
-    panel.Size = UDim2.fromOffset(width, PANEL_H)
-    panel.Position = UDim2.fromOffset(math.max(math.floor(pos.X + (size.X - width) / 2), 4), math.floor(y))
-    panel.Visible = true
-
-    local now = os.clock()
-    if now - lastRead > 0.1 then
-        lastRead = now
-        readSlots(trade)
-    end
-
-    -- Tags sit on the top edge *inside* their slot. Staying inside the slot
-    -- bounds keeps them correct whatever layout the offer grid uses, and the
-    -- top edge leaves the item name at the bottom of the slot readable.
-    for _, side in ipairs(SIDES) do
-        for i = 1, MAX_SLOTS do
-            local slot = slotItems[side.key][i]
-            local tag = slotTags[side.key][i]
-            if slot and slot.Parent and slot.Visible then
-                local sp, ss = slot.AbsolutePosition, slot.AbsoluteSize
-                tag.Size = UDim2.fromOffset(math.max(math.floor(ss.X), 44), TAG_H)
-                tag.Position = UDim2.fromOffset(math.floor(sp.X), math.floor(sp.Y + 2))
-                tag.Visible = true
-            else
-                tag.Visible = false
-            end
-        end
-    end
-end
-
-updateOverlay = function()
-    pcall(refreshPanel)
-    pcall(layout)
-end
-
-table.insert(_G.__TradeCheckerConns, RunService.RenderStepped:Connect(function()
-    if myGen ~= _G.__TradeCheckerGen then
-        pcall(function() screen:Destroy() end)
-        return
-    end
-    pcall(layout)
-end))
-
-end
-
--- Authoritative source: exact ItemIDs, amounts and chroma flags. The game's
--- own TradeModule listens to this same event; adding a listener is additive.
-local function onUpdateTrade(state)
-    if myGen ~= _G.__TradeCheckerGen or type(state) ~= "table" then return end
-
-    local meKey, themKey
-    if state.Player1 and state.Player1.Player == LocalPlayer then
-        meKey, themKey = "Player1", "Player2"
-    elseif state.Player2 and state.Player2.Player == LocalPlayer then
-        meKey, themKey = "Player2", "Player1"
-    else
+    local items = ok and decoded and decoded.items or nil
+    if not items then
+        Lib:Notify("Error!", "Could not reach the values API. Trade tools are disabled this session.", 5, "error")
         return
     end
 
-    liveYourItems, liveYourTotal, liveYourUnpriced = buildFromOffer(state[meKey].Offer)
-    liveTheirItems, liveTheirTotal, liveTheirUnpriced = buildFromOffer(state[themKey].Offer)
+    local NAME_FIXES = {
+        ["Ice Wing"] = "Icewing",
+        ["Gold Edlerwood Blade"] = "Gold Elderwood Blade",
+    }
 
-    local them = state[themKey].Player
-    livePartner = (them and them.Name) or livePartner
-    haveEvent = true
-    tradeOpen = true
+    local grouped = {}
+    local options = {}
+    local valueByLabel = {}
+    local labelByCleanName = {}
 
-    recompute()
-end
+    for _, item in ipairs(items) do
+        item.name = NAME_FIXES[item.name] or item.name
 
-table.insert(_G.__TradeCheckerConns, TradeRemotes.UpdateTrade.OnClientEvent:Connect(function(state)
-    pcall(onUpdateTrade, state)
-end))
+        local category = item.category
+        grouped[category] = grouped[category] or {}
+        table.insert(grouped[category], item)
 
-table.insert(_G.__TradeCheckerConns, TradeGUI:GetPropertyChangedSignal("Enabled"):Connect(function()
-    if myGen ~= _G.__TradeCheckerGen then return end
-    tradeOpen = TradeGUI.Enabled
-    if not tradeOpen then
-        haveEvent = false
-        livePartner = ""
-        liveYourItems, liveYourTotal, liveYourUnpriced = {}, 0, 0
-        liveTheirItems, liveTheirTotal, liveTheirUnpriced = {}, 0, 0
-    end
-    recompute()
-end))
+        local value = tonumber((tostring(item.value):gsub(",", ""))) or 0
+        local label = item.name .. " [Val: " .. item.value .. "]"
+        valueByLabel[label] = value
 
--- Safety net: if the script was executed mid-trade, no UpdateTrade fires
--- until someone changes an offer, so read the window directly until it does.
--- The overlay reads the same live totals, so keep polling for it even when
--- Live Mode is off (that toggle only decides what the menu tab shows).
-task.spawn(function()
-    while myGen == _G.__TradeCheckerGen do
-        if (liveMode or overlayEnabled) and TradeGUI.Enabled and not haveEvent then
-            tradeOpen = true
-            local trade = getTradeFrame()
-            if trade then
-                local yourFrame = trade:FindFirstChild("YourOffer")
-                local theirFrame = trade:FindFirstChild("TheirOffer")
-                liveYourItems, liveYourTotal, liveYourUnpriced = buildFromUI(yourFrame)
-                liveTheirItems, liveTheirTotal, liveTheirUnpriced = buildFromUI(theirFrame)
-
-                local userLabel = theirFrame and theirFrame:FindFirstChild("Username")
-                if userLabel and userLabel:IsA("TextLabel") then
-                    livePartner = (userLabel.Text or ""):gsub("[%(%)]", "")
-                end
-                pcall(recompute)
-            end
+        local cleaned = cleanString(item.name)
+        if not labelByCleanName[cleaned] or value > (valueByLabel[labelByCleanName[cleaned]] or 0) then
+            labelByCleanName[cleaned] = label
         end
-        task.wait(0.4)
+
+        table.insert(options, label)
     end
-end)
 
-resSec:Toggle("Live Mode (read trade window)", true, function(state)
-    liveMode = state
-    recompute()
-end)
-
-resSec:Toggle("In-Game Trade Overlay", true, function(state)
-    overlayEnabled = state
-    if updateOverlay then updateOverlay() end
-end)
-
-resSec:Toggle("Overlay Item Value Tags", true, function(state)
-    overlayTags = state
-    if updateOverlay then updateOverlay() end
-end)
-
---================================================================--
---                    MANUAL: YOUR OFFER                          --
---================================================================--
-
-local function getMyInventoryOptions()
-    local pGui = LocalPlayer:FindFirstChild("PlayerGui")
-    if not pGui then return dropdownOptions, 0 end
-    local inv = pGui:FindFirstChild("MainGUI") and pGui.MainGUI:FindFirstChild("Game") and pGui.MainGUI.Game:FindFirstChild("Inventory")
-    if not inv then return dropdownOptions, 0 end
-    local itemsContainer = inv:FindFirstChild("Main") and inv.Main:FindFirstChild("Weapons") and inv.Main.Weapons:FindFirstChild("Items") and inv.Main.Weapons.Items:FindFirstChild("Container")
-    if not itemsContainer then return dropdownOptions, 0 end
-
-    local foundItems = {}
-    local totalValue = 0
-
-    local function extractItem(itemFrame)
-        if itemFrame:IsA("Frame") and itemFrame.Name:match("NewItem") then
-            local itemNameFolder = itemFrame:FindFirstChild("ItemName")
-            if itemNameFolder then
-                local label = itemNameFolder:FindFirstChild("Label")
-                if label and label:IsA("TextLabel") then
-                    local rawText = label.Text or ""
-                    local itemName = rawText:gsub("<[^>]+>", ""):match("^%s*(.-)%s*$")
-                    if itemName and itemName ~= "" and itemName:lower() ~= "label" then
-
-                        local multiplier = 1
-                        local itemLower = itemName:lower()
-                        local multMatch1 = itemLower:match("x%s*(%d+)$")
-                        local multMatch2 = itemLower:match("%(x%s*(%d+)%)$")
-
-                        if multMatch1 then multiplier = tonumber(multMatch1) or 1
-                        elseif multMatch2 then multiplier = tonumber(multMatch2) or 1 end
-
-                        if multiplier == 1 then
-                            for _, desc in ipairs(itemFrame:GetDescendants()) do
-                                if desc:IsA("TextLabel") then
-                                    local dName = desc.Name:lower()
-                                    if dName:match("quant") or dName:match("amount") or dName:match("count") then
-                                        local txt = desc.Text or ""
-                                        local m = txt:match("x%s*(%d+)") or txt:match("^(%d+)$")
-                                        if m then
-                                            multiplier = tonumber(m) or 1
-                                            break
-                                        end
-                                    end
-                                end
-                            end
-                        end
-
-                        local cleanName = itemLower:gsub("%s*x%s*%d+$", ""):gsub("%s*%(x%s*%d+%)$", ""):match("^%s*(.-)%s*$")
-
-                        -- Prefer the dedicated Chroma tag frame when the slot has one.
-                        local isChroma = false
-                        local tagsFrame = itemFrame:FindFirstChild("Tags")
-                        local chromaTag = tagsFrame and tagsFrame:FindFirstChild("Chroma")
-                        if chromaTag and chromaTag:IsA("GuiObject") then
-                            isChroma = chromaTag.Visible
-                        else
-                            local descendants = itemFrame:GetDescendants()
-                            for i = 1, #descendants do
-                                local desc = descendants[i]
-                                local dName = string.lower(desc.Name or "")
-                                if string.find(dName, "chroma", 1, true) then
-                                    isChroma = true
-                                    break
-                                elseif desc:IsA("TextLabel") and string.find(string.lower(desc.Text or ""), "chroma", 1, true) then
-                                    isChroma = true
-                                    break
-                                elseif desc:IsA("ImageLabel") and string.find(desc.Image or "", "4589252033", 1, true) then
-                                    isChroma = true
-                                    break
-                                end
-                            end
-                        end
-
-                        if isChroma and not string.find(cleanName, "chroma", 1, true) then
-                            cleanName = "chroma " .. cleanName
-                        end
-
-                        local fullText = cleanNameToFullText[cleanString(cleanName)]
-                        if fullText then
-                            local val = itemValuesMap[fullText] or 0
-                            foundItems[fullText] = (foundItems[fullText] or 0) + multiplier
-                            totalValue = totalValue + (val * multiplier)
-                        end
-                    end
-                end
-            end
+    table.sort(options, function(a, b)
+        local valueA = valueByLabel[a] or 0
+        local valueB = valueByLabel[b] or 0
+        if valueA == valueB then
+            return a < b
         end
-    end
-
-    for _, tab in ipairs(itemsContainer:GetChildren()) do
-        if tab:IsA("ScrollingFrame") then
-            local tabContainer = tab:FindFirstChild("Container")
-            if tabContainer then
-                for _, child in ipairs(tabContainer:GetChildren()) do
-                    if child:IsA("Frame") and child.Name:match("NewItem") then
-                        extractItem(child)
-                    elseif child:IsA("Frame") and child.Name ~= "UIGridLayout" and child.Name ~= "EventLayout" then
-                        local eventContainer = child:FindFirstChild("Container")
-                        if eventContainer then
-                            for _, evChild in ipairs(eventContainer:GetChildren()) do
-                                extractItem(evChild)
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
-
-    local sorted = {}
-    for item, qty in pairs(foundItems) do
-        local displayStr = item
-        if qty > 1 then
-            local namePart, restPart = item:match("^(.-)(%s*%[Val:.*)$")
-            if namePart and restPart then
-                displayStr = namePart .. " (x" .. tostring(qty) .. ")" .. restPart
-            else
-                displayStr = item .. " (x" .. tostring(qty) .. ")"
-            end
-        end
-        table.insert(sorted, displayStr)
-    end
-    table.sort(sorted, function(a, b)
-        local cleanA = a:gsub("%s*%(x%d+%)", "")
-        local cleanB = b:gsub("%s*%(x%d+%)", "")
-        local valA = itemValuesMap[cleanA] or 0
-        local valB = itemValuesMap[cleanB] or 0
-        if valA == valB then return a < b end
-        return valB < valA
+        return valueA > valueB
     end)
 
-    return sorted, totalValue
-end
+    local Values = {
+        grouped = grouped,
+        options = options,
+        valueByLabel = valueByLabel,
+        labelByCleanName = labelByCleanName,
+    }
 
-local myInventoryOptions, myTotalValue = getMyInventoryOptions()
+    function Values.findLabel(name)
+        return labelByCleanName[cleanString(name)]
+    end
 
-local yourDropdownInv = yourSec:Dropdown("Select From Inventory", {}, myInventoryOptions, true, function(selected)
-    yourSelectedInv = selected
-    recompute()
-end, "Search your owned weapons", true)
+    function Values.lookup(name)
+        local label = labelByCleanName[cleanString(name)]
+        if not label then
+            return nil
+        end
+        return valueByLabel[label] or 0
+    end
 
-local totalInvLabel = yourSec:Label("Total Inventory Value: " .. comma(myTotalValue))
+    function Values.sortByValue(labels)
+        table.sort(labels, function(a, b)
+            local valueA = valueByLabel[(a:gsub("%s*%(x%d+%)", ""))] or 0
+            local valueB = valueByLabel[(b:gsub("%s*%(x%d+%)", ""))] or 0
+            if valueA == valueB then
+                return a < b
+            end
+            return valueA > valueB
+        end)
+        return labels
+    end
 
-yourSec:Button("Refresh Inventory", function()
-    local newOpts, newTotal = getMyInventoryOptions()
-    myInventoryOptions = newOpts
-    if yourDropdownInv.UpdateChoices then
-        yourDropdownInv:UpdateChoices(myInventoryOptions)
-        totalInvLabel:SetText("Total Inventory Value: " .. comma(newTotal))
-        Lib:Notify("Success", "Inventory refreshed! Total Value: " .. comma(newTotal), 3, "success")
+    Ctx.Values = Values
+
+    ----------------------------------------------------------------
+    -- Browse tab
+    ----------------------------------------------------------------
+
+    local CATEGORY_GROUPS = {
+        { name = "All Items", categories = { "ancient", "unique", "chroma", "godly", "legendary", "rare", "uncommon", "common", "vintage", "pets", "misc" } },
+        { name = "Ancient", categories = { "ancient" } },
+        { name = "Unique", categories = { "unique" } },
+        { name = "Chromas", categories = { "chroma" } },
+        { name = "Godly", categories = { "godly" } },
+        { name = "Legendary", categories = { "legendary" } },
+        { name = "Rare", categories = { "rare" } },
+        { name = "Uncommon", categories = { "uncommon" } },
+        { name = "Common", categories = { "common" } },
+        { name = "Vintage", categories = { "vintage" } },
+        { name = "Pets & Misc", categories = { "pets", "misc" } },
+    }
+
+    local browseSection = Ctx.tabs.values:Section("Browse Values", "Full")
+
+    for _, group in ipairs(CATEGORY_GROUPS) do
+        local groupOptions = {}
+
+        for _, category in ipairs(group.categories) do
+            for _, item in ipairs(grouped[category] or {}) do
+                table.insert(groupOptions, string.format(
+                    "%s [Val: %s | Dem: %s | Stab: %s]",
+                    item.name, item.value, item.demand, item.stability
+                ))
+            end
+        end
+
+        if #groupOptions > 0 then
+            browseSection:Dropdown(group.name, "nil", groupOptions, false, nil,
+                "Browse & Search " .. group.name .. " Items", true)
+        end
     end
 end)
 
-local yourDropdownAll = yourSec:Dropdown("Select From All Items", {}, dropdownOptions, true, function(selected)
-    yourSelectedAll = selected
-    recompute()
-end, "Search any weapon", true)
-
-yourSec:Button("Clear Your Offer", function()
-    if yourDropdownInv.Set then yourDropdownInv:Set({}) end
-    if yourDropdownAll.Set then yourDropdownAll:Set({}) end
-    yourSelectedInv = {}
-    yourSelectedAll = {}
-    recompute()
-end)
-
 --================================================================--
---                    MANUAL: THEIR OFFER                         --
+--                     MODULE: TRADE CHECKER                      --
 --================================================================--
 
-local theirDropdown = theirSec:Dropdown("Select Items", {}, dropdownOptions, true, function(selected)
-    theirSelected = selected
-    recompute()
-end, "Search and select their weapons", true)
+defineModule("trade", function(Ctx)
+    local Lib = Ctx.Lib
+    local Values = Ctx.Values
+    local comma = Util.comma
 
-theirSec:Button("Clear Their Offer", function()
-    theirDropdown:Set({})
-    theirSelected = {}
-    recompute()
-end)
+    local tradeTab = Ctx.tabs.trade
+    local yourSection = tradeTab:Section("Your Offer", "Left")
+    local theirSection = tradeTab:Section("Their Offer", "Right")
+    local resultSection = tradeTab:Section("Result", "Full")
 
-theirSec:Divider("Profile Scanner")
+    if not Values then
+        resultSection:Label("Item values are unavailable - the values API could not be reached.")
+        return
+    end
 
-local function getProfileItems()
-    local detected = {}
-    local pGui = LocalPlayer:FindFirstChild("PlayerGui")
-    if not pGui then return detected end
+    local MAX_SLOTS = 4 -- MM2 trades are hard-capped at 4 items per side
 
-    local vp = pGui.MainGUI.Game:FindFirstChild("ViewProfile")
-    if not vp then return detected end
+    ----------------------------------------------------------------
+    -- Menu labels
+    ----------------------------------------------------------------
 
-    local main = vp:FindFirstChild("Main")
-    if not main then return detected end
+    local yourValueLabel = yourSection:Label("Total Value: 0")
+    local yourSlotLabels = {}
+    for index = 1, MAX_SLOTS do
+        yourSlotLabels[index] = yourSection:Label("")
+    end
 
-    local w = main:FindFirstChild("Weapons")
-    if not w then return detected end
+    local theirValueLabel = theirSection:Label("Total Value: 0")
+    local theirSlotLabels = {}
+    for index = 1, MAX_SLOTS do
+        theirSlotLabels[index] = theirSection:Label("")
+    end
 
-    local items = w:FindFirstChild("Items")
-    if not items then return detected end
+    local liveStatusLabel = resultSection:Label("Live Mode: waiting for a trade to open...")
+    local livePartnerLabel = resultSection:Label("Trading with: -")
+    local resultLabel = resultSection:Label("Status: Waiting for items...")
 
-    for _, child in ipairs(items:GetDescendants()) do
-        if child:IsA("Frame") and (child.Name:match("^NewItem") or child.Name:match("^Item_")) then
-            local itemNameFrame = child:FindFirstChild("ItemName")
-            local label = itemNameFrame and itemNameFrame:FindFirstChild("Label")
-            if label and label:IsA("TextLabel") and label.Text ~= "" and label.Text ~= "Label" and label.Text ~= "Loading..." then
-                local rawText = label.Text or ""
-                local cleanName = rawText:gsub("<[^>]+>", ""):match("^%s*(.-)%s*$")
-                if cleanName and cleanName ~= "" then
-                    cleanName = cleanName:lower():gsub("%s*x%s*%d+$", ""):gsub("%s*%(x%s*%d+%)$", "")
+    ----------------------------------------------------------------
+    -- Live trade plumbing
+    ----------------------------------------------------------------
 
-                    local isChroma = false
-                    local tagsFrame = child:FindFirstChild("Tags")
-                    local chromaTag = tagsFrame and tagsFrame:FindFirstChild("Chroma")
-                    if chromaTag and chromaTag:IsA("GuiObject") then
-                        isChroma = chromaTag.Visible
+    local tradeRemotes = Services.ReplicatedStorage:WaitForChild("Trade", 10)
+    local tradeGui = LocalPlayer:WaitForChild("PlayerGui", 10)
+    tradeGui = tradeGui and tradeGui:WaitForChild("TradeGUI", 10)
+
+    if not (tradeRemotes and tradeRemotes:FindFirstChild("UpdateTrade") and tradeGui) then
+        liveStatusLabel:SetText("Live Mode: the MM2 trade GUI was not found in this place.")
+        return
+    end
+
+    -- Sync is the item database: Sync.Item == Sync.Weapons, plus Sync.Pets.
+    -- Records look like { ItemName = "Seer", Rarity = "Godly", Chroma = true }.
+    local Sync
+    do
+
+        local ok, module = pcall(function()
+            return require(Services.ReplicatedStorage:WaitForChild("Database"):WaitForChild("Sync"))
+        end)
+        Sync = ok and module or nil
+    end
+
+    local liveMode = true       -- toggle
+    local tradeOpen = false     -- tradeGui.Enabled
+    local haveEvent = false     -- an UpdateTrade payload arrived for this trade
+    local livePartner = ""
+
+    local liveYour = { items = {}, total = 0, unpriced = 0 }
+    local liveTheir = { items = {}, total = 0, unpriced = 0 }
+
+    local overlayEnabled = true
+    local overlayTags = true
+    local updateOverlay
+
+    local function displayNameFor(itemId, itemType)
+        local record
+        if Sync then
+            if itemType and Sync[itemType] then
+                record = Sync[itemType][itemId]
+            end
+            if not record then
+                record = (Sync.Item and Sync.Item[itemId]) or (Sync.Pets and Sync.Pets[itemId])
+            end
+        end
+
+        if not record then
+            return tostring(itemId)
+        end
+
+        local name = record.ItemName or record.Name or tostring(itemId)
+        if record.Chroma and not tostring(name):lower():find("chroma", 1, true) then
+            name = "Chroma " .. name
+        end
+        return name
+    end
+
+    local function buildFromOffer(offerTable)
+        local offer = { items = {}, total = 0, unpriced = 0 }
+        if type(offerTable) ~= "table" then
+            return offer
+        end
+
+        for _, entry in pairs(offerTable) do
+            if type(entry) == "table" then
+                local itemId = entry[1] or entry.ItemID
+                local amount = tonumber(entry[2] or entry.Amount) or 1
+                local itemType = entry[3] or entry.ItemType
+
+                if itemId then
+                    local name = displayNameFor(itemId, itemType)
+                    local value = Values.lookup(name)
+                    if value then
+                        offer.total = offer.total + (value * amount)
                     else
-                        for _, desc in ipairs(child:GetDescendants()) do
-                            local dName = string.lower(desc.Name or "")
-                            if string.find(dName, "chroma", 1, true) then
-                                isChroma = true
-                                break
-                            elseif desc:IsA("TextLabel") and string.find(string.lower(desc.Text or ""), "chroma", 1, true) then
-                                isChroma = true
-                                break
-                            elseif desc:IsA("ImageLabel") and string.find(desc.Image or "", "4589252033", 1, true) then
-                                isChroma = true
-                                break
-                            end
-                        end
+                        offer.unpriced = offer.unpriced + 1
                     end
-
-                    if isChroma and not string.find(cleanName, "chroma", 1, true) then
-                        cleanName = "chroma " .. cleanName
-                    end
-
-                    table.insert(detected, cleanName)
+                    table.insert(offer.items, { name = name, qty = amount, value = value })
                 end
             end
         end
+
+        return offer
     end
-    return detected
-end
 
-local detectedDropdown
+    local function getTradeFrame()
+        local container = tradeGui:FindFirstChild("Container")
+        return container and container:FindFirstChild("Trade")
+    end
 
-theirSec:Button("Scan Opened Profile", function()
-    local detected = getProfileItems()
-    if #detected == 0 then
-        if detectedDropdown then
-            detectedDropdown:UpdateChoices({})
-            detectedDropdown:Set({})
+    local CHROMA_IMAGE_ID = "4589252033"
+
+    local function isChromaFrame(frame)
+        local tags = frame:FindFirstChild("Tags")
+        local chromaTag = tags and tags:FindFirstChild("Chroma")
+        if chromaTag and chromaTag:IsA("GuiObject") then
+            return chromaTag.Visible
         end
-        Lib:Notify("No items", "No items detected! Ensure you have someone's profile open and clicked 'Inventory'.", 3)
-        return
-    end
 
-    local matchedList = {}
-    for _, cleanName in ipairs(detected) do
-        local fullText = findFullItemName(cleanName)
-        if fullText then
-            table.insert(matchedList, fullText)
-        end
-    end
-
-    table.sort(matchedList, function(a, b)
-        local cleanA = a:gsub("%s*%(x%d+%)", "")
-        local cleanB = b:gsub("%s*%(x%d+%)", "")
-        local valA = itemValuesMap[cleanA] or 0
-        local valB = itemValuesMap[cleanB] or 0
-        if valA == valB then return a < b end
-        return valB < valA
-    end)
-
-    if #matchedList == 0 then
-        if detectedDropdown then
-            detectedDropdown:UpdateChoices({})
-            detectedDropdown:Set({})
-        end
-        Lib:Notify("No matches", "Profile items detected but they don't match the MM2 values list.", 3, "warning")
-    else
-        if detectedDropdown then
-            detectedDropdown:UpdateChoices(matchedList)
-            detectedDropdown:Set({})
-        end
-        Lib:Notify("Success", "Scanned " .. tostring(#matchedList) .. " items! Check the dropdown below.", 3, "success")
-    end
-end)
-
-detectedDropdown = theirSec:Dropdown("Scanned Profile Items", {}, {}, true, function(selected)
-    local current = {}
-    local oldSelected = theirDropdown:Get()
-    if type(oldSelected) == "table" then
-        for _, v in ipairs(oldSelected) do
-            table.insert(current, v)
-        end
-    elseif type(oldSelected) == "string" and oldSelected ~= "" then
-        table.insert(current, oldSelected)
-    end
-
-    if type(selected) == "table" then
-        for _, item in ipairs(selected) do
-            local exists = false
-            for _, val in ipairs(current) do
-                if val == item then exists = true; break end
-            end
-            if not exists then
-                table.insert(current, item)
-            end
-        end
-    elseif type(selected) == "string" and selected ~= "" then
-        local exists = false
-        for _, val in ipairs(current) do
-            if val == selected then exists = true; break end
-        end
-        if not exists then
-            table.insert(current, selected)
-        end
-    end
-
-    theirDropdown:Set(current)
-    theirSelected = current
-    recompute()
-end, "Select items to add to their offer", true)
-
-theirSec:Button("Clear Scanned Items", function()
-    if detectedDropdown then
-        detectedDropdown:UpdateChoices({})
-        detectedDropdown:Set({})
-    end
-end)
-
-resSec:Button("Clear All Tables", function()
-    if yourDropdownInv and yourDropdownInv.Set then yourDropdownInv:Set({}) end
-    if yourDropdownAll and yourDropdownAll.Set then yourDropdownAll:Set({}) end
-    if theirDropdown and theirDropdown.Set then theirDropdown:Set({}) end
-
-    yourSelectedInv = {}
-    yourSelectedAll = {}
-    theirSelected = {}
-    recompute()
-end)
-
--- Pick up a trade that is already open at load time.
-tradeOpen = TradeGUI.Enabled
-recompute()
-
-end
-
---================================================================--
---                     TAB: ITEM VALUES                           --
---================================================================--
-
-local valuesTab = win:Tab("Item Values", "search")
-local valuesSec = valuesTab:Section("Browse Values", "Full")
-
-local categoryGroups = {
-    {name = "All Items", categories = {"ancient", "unique", "chroma", "godly", "legendary", "rare", "uncommon", "common", "vintage", "pets", "misc"}},
-    {name = "Ancient", categories = {"ancient"}},
-    {name = "Unique", categories = {"unique"}},
-    {name = "Chromas", categories = {"chroma"}},
-    {name = "Godly", categories = {"godly"}},
-    {name = "Legendary", categories = {"legendary"}},
-    {name = "Rare", categories = {"rare"}},
-    {name = "Uncommon", categories = {"uncommon"}},
-    {name = "Common", categories = {"common"}},
-    {name = "Vintage", categories = {"vintage"}},
-    {name = "Pets & Misc", categories = {"pets", "misc"}}
-}
-
-for _, group in ipairs(categoryGroups) do
-    local dropdownOptionsForGroup = {}
-    
-    for _, catName in ipairs(group.categories) do
-        if groupedItems[catName] then
-            for _, item in ipairs(groupedItems[catName]) do
-                local dropText = string.format("%s [Val: %s | Dem: %s | Stab: %s]", item.name, item.value, item.demand, item.stability)
-                table.insert(dropdownOptionsForGroup, dropText)
-            end
-        end
-    end
-    
-    if #dropdownOptionsForGroup > 0 then
-        local valDrop
-        valDrop = valuesSec:Dropdown(group.name, "nil", dropdownOptionsForGroup, false, function(selected)
-            
-        end, "Browse & Search " .. group.name .. " Items", true)
-    end
-end
-
---================================================================--
---             TABS: COMBAT / VISUALS / MISC (setup)              --
---================================================================--
-
-local combatTab = win:Tab("Combat", "swords")
-local visualsTab = win:Tab("Visuals", "eye")
-local miscTab = win:Tab("Misc", "shield")
-
---================================================================--
---                  VISUALS: UI & TIMERS                          --
---================================================================--
-
-local uiSec = visualsTab:Section("UI & Timers", "Left")
-uiSec:Toggle("Show Round Timer", false, function(state)
-    RoundTimerEnabled = state
-    TimerLabel.Visible = state
-end)
-
-uiSec:Colorpicker("Timer Color", Color3.fromRGB(255, 215, 0), function(color)
-    TimerLabel.Color = color
-end)
-
---================================================================--
---          MISC: PROTECTION (Anti-Fling / Anti-AFK)              --
---================================================================--
-
-local protectionSec = miscTab:Section("Protection", "Left")
-local steppedConnection = nil
-local PlayersService = game:GetService("Players")
-local RS = game:GetService("RunService")
-
-local function antiFlingLoop()
-    for _, player in ipairs(PlayersService:GetPlayers()) do
-        if player ~= PlayersService.LocalPlayer and player.Character then
-            
-            
-            for _, v in ipairs(player.Character:GetChildren()) do
-                if v:IsA("BasePart") then
-                    v.CanCollide = false
-                elseif v:IsA("Accessory") then
-                    local handle = v:FindFirstChild("Handle")
-                    if handle and handle:IsA("BasePart") then
-                        handle.CanCollide = false
-                    end
-                end
-            end
-        end
-    end
-end
-
-local AntiFlingEnabled = false
-protectionSec:Toggle("Enable Anti-Fling", false, function(state)
-    AntiFlingEnabled = state
-    if state then
-        Lib:Notify("Protection", "Anti-Fling is now ON", 3, "success")
-    else
-        Lib:Notify("Protection", "Anti-Fling is now OFF", 3, "warning")
-        for _, player in ipairs(PlayersService:GetPlayers()) do
-            if player ~= PlayersService.LocalPlayer and player.Character then
-                for _, v in ipairs(player.Character:GetChildren()) do
-                    if v:IsA("BasePart") then
-                        v.CanCollide = true
-                    elseif v:IsA("Accessory") then
-                        local handle = v:FindFirstChild("Handle")
-                        if handle and handle:IsA("BasePart") then
-                            handle.CanCollide = true
-                        end
-                    end
-                end
-            end
-        end
-    end
-end)
-
-task.spawn(function()
-    while true do
-        if AntiFlingEnabled then
-            antiFlingLoop()
-        end
-        task.wait(0.2)
-    end
-end)
-
-local AntiAfkEnabled = false
-local MOVE_KEYS = { 0x57, 0x41, 0x53, 0x44 }
-
-local function tapKey(vk)
-    pcall(keypress, vk)
-    task.wait(0.02)
-    pcall(keyrelease, vk)
-end
-
-protectionSec:Toggle("Enable Anti-AFK", false, function(state)
-    AntiAfkEnabled = state
-    if state then
-        Lib:Notify("Protection", "Anti-AFK is now ON", 3, "success")
-    else
-        Lib:Notify("Protection", "Anti-AFK is now OFF", 3, "warning")
-    end
-end)
-
-task.spawn(function()
-    math.randomseed(math.floor(os.clock() * 100000))
-    while true do
-        if AntiAfkEnabled then
-            local vk = MOVE_KEYS[math.random(1, #MOVE_KEYS)]
-            tapKey(vk)
-            task.wait(300) 
-        else
-            task.wait(0.5)
-        end
-    end
-end)
-
---================================================================--
---                    MISC: ROLE NOTIFIER                         --
---================================================================--
-
-local roleSec = miscTab:Section("Role Notifier", "Left")
-
-local RoleNotifierEnabled = false
-local CurrentMurderer = nil
-local CurrentSheriff = nil
-
-roleSec:Toggle("Enable Role Alerts", false, function(state)
-    RoleNotifierEnabled = state
-    if not state then
-        CurrentMurderer = nil
-        CurrentSheriff = nil
-    end
-end)
-
-local function scanForRoles()
-    local foundMurds = {}
-    local foundSheriffs = {}
-    
-    for _, p in ipairs(game:GetService("Players"):GetPlayers()) do
-        if p.Character then
-            local bp = p:FindFirstChildOfClass("Backpack")
-            local function got(c, n) return c and c:FindFirstChild(n) ~= nil end
-            
-            if got(bp, "Knife") or got(p.Character, "Knife") then
-                table.insert(foundMurds, p.Name)
-            elseif got(bp, "Gun") or got(p.Character, "Gun") then
-                table.insert(foundSheriffs, p.Name)
-            end
-        end
-    end
-    
-    local murdStr = table.concat(foundMurds, ", ")
-    local sherStr = table.concat(foundSheriffs, ", ")
-    
-    if murdStr == "" then murdStr = nil end
-    if sherStr == "" then sherStr = nil end
-    
-    if murdStr ~= CurrentMurderer then
-        CurrentMurderer = murdStr
-        if CurrentMurderer then
-            Lib:Notify("Role Alert", "Murderer is: " .. CurrentMurderer, 5, "error")
-        end
-    end
-    
-    if sherStr ~= CurrentSheriff then
-        CurrentSheriff = sherStr
-        if CurrentSheriff then
-            Lib:Notify("Role Alert", "Sheriff is: " .. CurrentSheriff, 5, "info")
-        end
-    end
-end
-
-task.spawn(function()
-    while true do
-        if RoleNotifierEnabled then
-            pcall(scanForRoles)
-        end
-        task.wait(1)
-    end
-end)
-
---================================================================--
---                      MISC: TELEPORTS                           --
---================================================================--
-
-pcall(function()
-    local teleportSec = miscTab:Section("Teleport", "Right")
-    if not teleportSec then return end
-    local teleportPlayers = game:GetService("Players")
-
-    local function getTeleportHRP()
-        local localPlayer = teleportPlayers.LocalPlayer
-        local character = localPlayer and localPlayer.Character
-        if not character then return nil end
-        return character:FindFirstChild("HumanoidRootPart")
-    end
-
-    local function hasToolNamed(container, toolName)
-        if not container then return false end
-        for _, item in ipairs(container:GetChildren()) do
-            if item:IsA("Tool") and item.Name == toolName then
+        for _, descendant in ipairs(frame:GetDescendants()) do
+            if string.find(string.lower(descendant.Name or ""), "chroma", 1, true) then
+                return true
+            elseif descendant:IsA("TextLabel") and string.find(string.lower(descendant.Text or ""), "chroma", 1, true) then
+                return true
+            elseif descendant:IsA("ImageLabel") and string.find(descendant.Image or "", CHROMA_IMAGE_ID, 1, true) then
                 return true
             end
         end
+
         return false
     end
 
-    local function findRoleTargetPlayer(toolName)
-        for _, player in ipairs(teleportPlayers:GetPlayers()) do
-            if player ~= teleportPlayers.LocalPlayer and player.Character then
-                local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
-                local targetRoot = player.Character:FindFirstChild("HumanoidRootPart")
-                if humanoid and humanoid.Health > 0 and targetRoot then
-                    local backpack = player:FindFirstChildOfClass("Backpack")
-                    if hasToolNamed(player.Character, toolName) or hasToolNamed(backpack, toolName) then
-                        return player, targetRoot
+    local function withChromaPrefix(name, frame)
+        if not isChromaFrame(frame) then
+            return name
+        end
+        if string.find(string.lower(name), "chroma", 1, true) then
+            return name
+        end
+        return "Chroma " .. name
+    end
+
+    local function readSlotItem(slot)
+        if not (slot and slot.Visible) then
+            return nil
+        end
+
+        local nameFrame = slot:FindFirstChild("ItemName")
+        local label = nameFrame and nameFrame:FindFirstChild("Label")
+        if not (label and label:IsA("TextLabel")) then
+            return nil
+        end
+
+        local name = ((label.Text or ""):gsub("<[^>]+>", "")):match("^%s*(.-)%s*$")
+        local lowered = name:lower()
+        if name == "" or lowered == "loading" or lowered == "label" then
+            return nil
+        end
+
+        name = withChromaPrefix(name, slot)
+
+        local quantity = 1
+        local container = slot:FindFirstChild("Container")
+        local amountLabel = container and container:FindFirstChild("Amount")
+        if amountLabel and amountLabel:IsA("TextLabel") then
+            quantity = tonumber((amountLabel.Text or ""):match("x%s*(%d+)")) or 1
+        end
+
+        return { name = name, qty = quantity, value = Values.lookup(name) }
+    end
+
+    local function buildFromUI(offerFrame)
+        local offer = { items = {}, total = 0, unpriced = 0 }
+        local container = offerFrame and offerFrame:FindFirstChild("Container")
+        if not container then
+            return offer
+        end
+
+        for index = 1, MAX_SLOTS do
+            local item = readSlotItem(container:FindFirstChild("NewItem" .. index))
+            if item then
+                if item.value then
+                    offer.total = offer.total + (item.value * item.qty)
+                else
+                    offer.unpriced = offer.unpriced + 1
+                end
+                table.insert(offer.items, item)
+            end
+        end
+
+        return offer
+    end
+
+    ----------------------------------------------------------------
+    -- Rendering
+    ----------------------------------------------------------------
+
+    local COLOR_ITEM = Color3.fromRGB(220, 220, 220)
+    local COLOR_UNPRICED = Color3.fromRGB(255, 180, 60)
+    local COLOR_NEUTRAL = Color3.fromRGB(200, 200, 200)
+    local COLOR_WIN = Color3.fromRGB(50, 255, 50)
+    local COLOR_LOSE = Color3.fromRGB(255, 50, 50)
+    local COLOR_FAIR = Color3.fromRGB(255, 255, 255)
+
+    local yourTotal, theirTotal = 0, 0
+    local yourSelectedInventory, yourSelectedAll, theirSelected = {}, {}, {}
+
+    local function liveActive()
+        return liveMode and tradeOpen
+    end
+
+    local function renderSlots(labels, items)
+        for index = 1, MAX_SLOTS do
+            local item = items[index]
+            if not item then
+                labels[index]:SetText("")
+            else
+                local quantity = item.qty > 1 and (" x" .. tostring(item.qty)) or ""
+                if item.value then
+                    labels[index]:SetText(item.name .. quantity .. " - " .. comma(item.value * item.qty))
+                    labels[index]:SetColor(COLOR_ITEM)
+                else
+                    labels[index]:SetText(item.name .. quantity .. " - [no value listed]")
+                    labels[index]:SetColor(COLOR_UNPRICED)
+                end
+            end
+        end
+    end
+
+    local function updateResult()
+        if yourTotal == 0 and theirTotal == 0 then
+            resultLabel:SetText("Status: Waiting for items...")
+            resultLabel:SetColor(COLOR_NEUTRAL)
+        elseif yourTotal > theirTotal then
+            resultLabel:SetText("YOU LOSE! (Loss: " .. comma(yourTotal - theirTotal) .. ")")
+            resultLabel:SetColor(COLOR_LOSE)
+        elseif theirTotal > yourTotal then
+            resultLabel:SetText("YOU WIN! (Profit: " .. comma(theirTotal - yourTotal) .. ")")
+            resultLabel:SetColor(COLOR_WIN)
+        else
+            resultLabel:SetText("FAIR TRADE! (Equal Value)")
+            resultLabel:SetColor(COLOR_FAIR)
+        end
+    end
+
+    local function sumManual(list)
+        local total = 0
+        for _, label in ipairs(list) do
+            local quantity = tonumber(label:match("%(x(%d+)%)")) or 1
+            total = total + ((Values.valueByLabel[(label:gsub("%s*%(x%d+%)", ""))] or 0) * quantity)
+        end
+        return total
+    end
+
+    local function recompute()
+        if liveActive() then
+            yourTotal = liveYour.total
+            theirTotal = liveTheir.total
+
+            renderSlots(yourSlotLabels, liveYour.items)
+            renderSlots(theirSlotLabels, liveTheir.items)
+
+            local yourSuffix = liveYour.unpriced > 0 and (" (" .. liveYour.unpriced .. " unpriced)") or ""
+            local theirSuffix = liveTheir.unpriced > 0 and (" (" .. liveTheir.unpriced .. " unpriced)") or ""
+            yourValueLabel:SetText("Total Value: " .. comma(yourTotal) .. yourSuffix)
+            theirValueLabel:SetText("Total Value: " .. comma(theirTotal) .. theirSuffix)
+
+            liveStatusLabel:SetText("Live Mode: reading " .. (haveEvent and "trade data" or "trade window") .. " (manual lists ignored)")
+            liveStatusLabel:SetColor(COLOR_WIN)
+            livePartnerLabel:SetText("Trading with: " .. (livePartner ~= "" and livePartner or "-"))
+        else
+            yourTotal = sumManual(yourSelectedInventory) + sumManual(yourSelectedAll)
+            theirTotal = sumManual(theirSelected)
+
+            renderSlots(yourSlotLabels, {})
+            renderSlots(theirSlotLabels, {})
+
+            yourValueLabel:SetText("Total Value: " .. comma(yourTotal))
+            theirValueLabel:SetText("Total Value: " .. comma(theirTotal))
+
+            if liveMode then
+                liveStatusLabel:SetText("Live Mode: waiting for a trade to open...")
+                liveStatusLabel:SetColor(COLOR_NEUTRAL)
+            else
+                liveStatusLabel:SetText("Live Mode: OFF - using manual selections")
+                liveStatusLabel:SetColor(COLOR_UNPRICED)
+            end
+            livePartnerLabel:SetText("Trading with: -")
+        end
+
+        updateResult()
+
+        if updateOverlay then
+            updateOverlay()
+        end
+    end
+
+    ----------------------------------------------------------------
+    -- In-game trade overlay
+    ----------------------------------------------------------------
+
+
+    do
+        local PANEL_W_MIN, PANEL_W_MAX, PANEL_H, BAR_H, TAG_H = 280, 620, 80, 26, 18
+        local OVERLAY_NAME = "LeatherHubTradeOverlay"
+
+        local COL_WIN = Color3.fromRGB(60, 220, 110)
+        local COL_LOSE = Color3.fromRGB(240, 70, 70)
+        local COL_FAIR = Color3.fromRGB(235, 235, 235)
+        local COL_PANEL = Color3.fromRGB(22, 22, 26)
+        local COL_TAG = Color3.fromRGB(16, 16, 20)
+        local COL_TRACK = Color3.fromRGB(44, 44, 52)
+        local COL_STROKE = Color3.fromRGB(70, 70, 82)
+        local COL_DETAIL = Color3.fromRGB(185, 185, 195)
+
+        local function make(class, props, parent)
+            local instance = Instance.new(class)
+            for property, value in pairs(props) do
+                instance[property] = value
+            end
+            instance.Parent = parent
+            return instance
+        end
+
+        local function overlayParent()
+            local ok, hidden = pcall(function()
+                return gethui and gethui()
+            end)
+            if ok and hidden then
+                return hidden
+            end
+
+            local okCore, coreGui = pcall(function()
+                return game:GetService("CoreGui")
+            end)
+            if okCore and coreGui then
+                return coreGui
+            end
+
+            return LocalPlayer:WaitForChild("PlayerGui")
+        end
+
+        for _, place in ipairs({ overlayParent(), LocalPlayer:FindFirstChild("PlayerGui") }) do
+            local stale = place and place:FindFirstChild(OVERLAY_NAME)
+            if stale then
+                stale:Destroy()
+            end
+        end
+
+        local screen = Instance.new("ScreenGui")
+        screen.Name = OVERLAY_NAME
+        screen.ResetOnSpawn = false
+        screen.DisplayOrder = 9999
+        screen.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+        screen.IgnoreGuiInset = tradeGui.IgnoreGuiInset
+        screen.Enabled = false
+
+        if not pcall(function()
+            screen.Parent = overlayParent()
+        end) then
+            screen.Parent = LocalPlayer:WaitForChild("PlayerGui")
+        end
+
+        pcall(function()
+            if syn and syn.protect_gui then
+                syn.protect_gui(screen)
+            end
+        end)
+
+        local panel = make("Frame", {
+            Name = "Panel",
+            BackgroundColor3 = COL_PANEL,
+            BackgroundTransparency = 0.08,
+            BorderSizePixel = 0,
+            Size = UDim2.fromOffset(PANEL_W_MIN, PANEL_H),
+            Visible = false,
+        }, screen)
+        make("UICorner", { CornerRadius = UDim.new(0, 8) }, panel)
+        make("UIStroke", { Color = COL_STROKE, Thickness = 1, Transparency = 0.25 }, panel)
+
+        local statusLabel = make("TextLabel", {
+            BackgroundTransparency = 1,
+            Position = UDim2.fromOffset(0, 6),
+            Size = UDim2.new(1, 0, 0, 20),
+            Font = Enum.Font.GothamBold,
+            TextSize = 16,
+            Text = "WAITING FOR ITEMS",
+            TextColor3 = COL_FAIR,
+        }, panel)
+
+        local bar = make("Frame", {
+            BackgroundColor3 = COL_TRACK,
+            BorderSizePixel = 0,
+            Position = UDim2.new(0, 10, 0, 30),
+            Size = UDim2.new(1, -20, 0, BAR_H),
+        }, panel)
+        make("UICorner", { CornerRadius = UDim.new(0, 4) }, bar)
+
+        local fill = make("Frame", {
+            BackgroundColor3 = COL_FAIR,
+            BorderSizePixel = 0,
+            Size = UDim2.new(0, 0, 1, 0),
+            ZIndex = 2,
+        }, bar)
+        make("UICorner", { CornerRadius = UDim.new(0, 4) }, fill)
+
+        make("Frame", {
+            BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+            BackgroundTransparency = 0.3,
+            BorderSizePixel = 0,
+            AnchorPoint = Vector2.new(0.5, 0),
+            Position = UDim2.new(0.5, 0, 0, 0),
+            Size = UDim2.new(0, 2, 1, 0),
+            ZIndex = 3,
+        }, bar)
+
+        local yourBarLabel = make("TextLabel", {
+            BackgroundTransparency = 1,
+            Position = UDim2.new(0, 8, 0, 0),
+            Size = UDim2.new(0.5, -10, 1, 0),
+            Font = Enum.Font.GothamBold,
+            TextSize = 13,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextColor3 = Color3.fromRGB(255, 255, 255),
+            TextStrokeTransparency = 0.4,
+            Text = "YOU 0",
+            ZIndex = 4,
+        }, bar)
+
+        local theirBarLabel = make("TextLabel", {
+            BackgroundTransparency = 1,
+            AnchorPoint = Vector2.new(1, 0),
+            Position = UDim2.new(1, -8, 0, 0),
+            Size = UDim2.new(0.5, -10, 1, 0),
+            Font = Enum.Font.GothamBold,
+            TextSize = 13,
+            TextXAlignment = Enum.TextXAlignment.Right,
+            TextColor3 = Color3.fromRGB(255, 255, 255),
+            TextStrokeTransparency = 0.4,
+            Text = "0 THEM",
+            ZIndex = 4,
+        }, bar)
+
+        local detailLabel = make("TextLabel", {
+            BackgroundTransparency = 1,
+            Position = UDim2.new(0, 10, 0, 59),
+            Size = UDim2.new(1, -20, 0, 16),
+            Font = Enum.Font.Gotham,
+            TextSize = 12,
+            TextColor3 = COL_DETAIL,
+            Text = "",
+        }, panel)
+
+        local SIDES = { { key = "your", frame = "YourOffer" }, { key = "their", frame = "TheirOffer" } }
+        local slotTags = { your = {}, their = {} }
+        local slotFrames = { your = {}, their = {} }
+
+        for _, side in ipairs(SIDES) do
+            for index = 1, MAX_SLOTS do
+                local tag = make("TextLabel", {
+                    Name = side.key .. "Tag" .. index,
+                    BackgroundColor3 = COL_TAG,
+                    BackgroundTransparency = 0.15,
+                    BorderSizePixel = 0,
+                    Font = Enum.Font.GothamBold,
+                    TextSize = 12,
+                    TextColor3 = COL_FAIR,
+                    Text = "",
+                    Visible = false,
+                    ZIndex = 2,
+                }, screen)
+                make("UICorner", { CornerRadius = UDim.new(0, 4) }, tag)
+                make("UIStroke", { Color = COL_STROKE, Thickness = 1, Transparency = 0.35 }, tag)
+                slotTags[side.key][index] = tag
+            end
+        end
+
+        local function refreshPanel()
+            local pot = liveYour.total + liveTheir.total
+            local diff = liveTheir.total - liveYour.total
+            local colour, text
+
+            if pot == 0 then
+                colour, text = COL_FAIR, "WAITING FOR ITEMS"
+            elseif diff > 0 then
+                colour, text = COL_WIN, "YOU WIN  +" .. comma(diff)
+            elseif diff < 0 then
+                colour, text = COL_LOSE, "YOU LOSE  -" .. comma(-diff)
+            else
+                colour, text = COL_FAIR, "FAIR TRADE"
+            end
+
+            statusLabel.Text = text
+            statusLabel.TextColor3 = colour
+            fill.BackgroundColor3 = colour
+            fill.Size = UDim2.new(pot > 0 and (liveYour.total / pot) or 0, 0, 1, 0)
+
+            yourBarLabel.Text = "YOU  " .. comma(liveYour.total)
+            theirBarLabel.Text = comma(liveTheir.total) .. "  THEM"
+
+            local unpriced = liveYour.unpriced + liveTheir.unpriced
+            local detail = "Trading with " .. (livePartner ~= "" and livePartner or "-")
+            if unpriced > 0 then
+                detail = detail .. "  |  " .. unpriced .. " item" .. (unpriced == 1 and "" or "s") .. " with no listed value"
+                detailLabel.TextColor3 = COLOR_UNPRICED
+            else
+                detailLabel.TextColor3 = COL_DETAIL
+            end
+            detailLabel.Text = detail
+        end
+
+        local lastRead = 0
+
+        local function readSlots(trade)
+            for _, side in ipairs(SIDES) do
+                local container = trade:FindFirstChild(side.frame)
+                container = container and container:FindFirstChild("Container")
+
+                for index = 1, MAX_SLOTS do
+                    local slot = container and container:FindFirstChild("NewItem" .. index)
+                    local item = overlayTags and slot and readSlotItem(slot) or nil
+                    slotFrames[side.key][index] = item and slot or nil
+
+                    local tag = slotTags[side.key][index]
+                    if item then
+                        if item.value then
+                            tag.Text = comma(item.value * item.qty)
+                            tag.TextColor3 = COL_FAIR
+                        else
+                            tag.Text = "?"
+                            tag.TextColor3 = COLOR_UNPRICED
+                        end
                     end
                 end
             end
         end
-        return nil, nil
-    end
 
-    local function getBoundsInfo(root)
-        if not root then return nil, nil end
+        local function layout()
+            local trade = getTradeFrame()
+            local show = overlayEnabled and tradeGui.Enabled and trade ~= nil and trade.AbsoluteSize.X > 0
+            if screen.Enabled ~= show then
+                screen.Enabled = show
+            end
+            if not show then
+                return
+            end
 
-        if root:IsA("BasePart") then
-            local p = root.Position
-            return p, p.Y + (root.Size.Y * 0.5)
-        end
+            if screen.IgnoreGuiInset ~= tradeGui.IgnoreGuiInset then
+                screen.IgnoreGuiInset = tradeGui.IgnoreGuiInset
+            end
 
-        if root:IsA("Model") then
-            local ok, cf, size = pcall(function()
-                return root:GetBoundingBox()
-            end)
-            if ok and cf and size then
-                local center = cf.Position
-                return center, center.Y + (size.Y * 0.5)
+            local position, size = trade.AbsolutePosition, trade.AbsoluteSize
+            local width = math.clamp(size.X, PANEL_W_MIN, PANEL_W_MAX)
+            local y = position.Y - PANEL_H - 8
+            if y < 4 then
+                y = position.Y + 8 -- no room above: sit inside the window
+            end
+
+            panel.Size = UDim2.fromOffset(width, PANEL_H)
+            panel.Position = UDim2.fromOffset(math.max(math.floor(position.X + (size.X - width) / 2), 4), math.floor(y))
+            panel.Visible = true
+
+            local now = os.clock()
+            if now - lastRead > 0.1 then
+                lastRead = now
+                readSlots(trade)
+            end
+
+            for _, side in ipairs(SIDES) do
+                for index = 1, MAX_SLOTS do
+                    local slot = slotFrames[side.key][index]
+                    local tag = slotTags[side.key][index]
+                    if slot and slot.Parent and slot.Visible then
+                        local slotPosition, slotSize = slot.AbsolutePosition, slot.AbsoluteSize
+                        tag.Size = UDim2.fromOffset(math.max(math.floor(slotSize.X), 44), TAG_H)
+                        tag.Position = UDim2.fromOffset(math.floor(slotPosition.X), math.floor(slotPosition.Y + 2))
+                        tag.Visible = true
+                    else
+                        tag.Visible = false
+                    end
+                end
             end
         end
 
-        local minX, minY, minZ = math.huge, math.huge, math.huge
-        local maxX, maxY, maxZ = -math.huge, -math.huge, -math.huge
+        updateOverlay = function()
+            refreshPanel()
+            layout()
+        end
+
+        Scheduler.onRender("trade.overlay", layout)
+    end
+
+    ----------------------------------------------------------------
+    -- Live trade hooks
+    ----------------------------------------------------------------
+
+    local function onUpdateTrade(state)
+        if type(state) ~= "table" then
+            return
+        end
+
+        local meKey, themKey
+        if state.Player1 and state.Player1.Player == LocalPlayer then
+            meKey, themKey = "Player1", "Player2"
+        elseif state.Player2 and state.Player2.Player == LocalPlayer then
+            meKey, themKey = "Player2", "Player1"
+        else
+            return
+        end
+
+        liveYour = buildFromOffer(state[meKey].Offer)
+        liveTheir = buildFromOffer(state[themKey].Offer)
+
+        local partner = state[themKey].Player
+        livePartner = (partner and partner.Name) or livePartner
+        haveEvent = true
+        tradeOpen = true
+
+        recompute()
+    end
+
+    Session.track(tradeRemotes.UpdateTrade.OnClientEvent:Connect(function(state)
+
+        local ok, err = pcall(onUpdateTrade, state)
+        if not ok then
+            warn("[LeatherHub] UpdateTrade handler failed: " .. tostring(err))
+        end
+    end))
+
+    Session.track(tradeGui:GetPropertyChangedSignal("Enabled"):Connect(function()
+        tradeOpen = tradeGui.Enabled
+        if not tradeOpen then
+            haveEvent = false
+            livePartner = ""
+            liveYour = { items = {}, total = 0, unpriced = 0 }
+            liveTheir = { items = {}, total = 0, unpriced = 0 }
+        end
+        recompute()
+    end))
+
+    Scheduler.every("trade.poll", 0.4, function()
+        if not ((liveMode or overlayEnabled) and tradeGui.Enabled and not haveEvent) then
+            return
+        end
+
+        tradeOpen = true
+        local trade = getTradeFrame()
+        if not trade then
+            return
+        end
+
+        local yourFrame = trade:FindFirstChild("YourOffer")
+        local theirFrame = trade:FindFirstChild("TheirOffer")
+        liveYour = buildFromUI(yourFrame)
+        liveTheir = buildFromUI(theirFrame)
+
+        local usernameLabel = theirFrame and theirFrame:FindFirstChild("Username")
+        if usernameLabel and usernameLabel:IsA("TextLabel") then
+            livePartner = (usernameLabel.Text or ""):gsub("[%(%)]", "")
+        end
+
+        recompute()
+    end)
+
+    resultSection:Toggle("Live Mode (read trade window)", true, function(state)
+        liveMode = state
+        recompute()
+    end)
+
+    resultSection:Toggle("In-Game Trade Overlay", true, function(state)
+        overlayEnabled = state
+        if updateOverlay then
+            updateOverlay()
+        end
+    end)
+
+    resultSection:Toggle("Overlay Item Value Tags", true, function(state)
+        overlayTags = state
+        if updateOverlay then
+            updateOverlay()
+        end
+    end)
+
+    ----------------------------------------------------------------
+    -- Manual: your offer
+    ----------------------------------------------------------------
+
+    local function readInventoryItem(itemFrame, found)
+        local nameFrame = itemFrame:FindFirstChild("ItemName")
+        local label = nameFrame and nameFrame:FindFirstChild("Label")
+        if not (label and label:IsA("TextLabel")) then
+            return 0
+        end
+
+        local name = ((label.Text or ""):gsub("<[^>]+>", "")):match("^%s*(.-)%s*$")
+        if not name or name == "" or name:lower() == "label" then
+            return 0
+        end
+
+        local lowered = name:lower()
+        local quantity = tonumber(lowered:match("x%s*(%d+)$") or lowered:match("%(x%s*(%d+)%)$")) or 1
+
+        if quantity == 1 then
+            for _, descendant in ipairs(itemFrame:GetDescendants()) do
+                if descendant:IsA("TextLabel") then
+                    local descendantName = descendant.Name:lower()
+                    if descendantName:match("quant") or descendantName:match("amount") or descendantName:match("count") then
+                        local text = descendant.Text or ""
+                        local match = text:match("x%s*(%d+)") or text:match("^(%d+)$")
+                        if match then
+                            quantity = tonumber(match) or 1
+                            break
+                        end
+                    end
+                end
+            end
+        end
+
+        local cleanName = lowered:gsub("%s*x%s*%d+$", ""):gsub("%s*%(x%s*%d+%)$", ""):match("^%s*(.-)%s*$")
+        cleanName = withChromaPrefix(cleanName, itemFrame)
+
+        local itemLabel = Values.findLabel(cleanName)
+        if not itemLabel then
+            return 0
+        end
+
+        found[itemLabel] = (found[itemLabel] or 0) + quantity
+        return (Values.valueByLabel[itemLabel] or 0) * quantity
+    end
+
+    local function getInventoryOptions()
+        local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+        local inventory = playerGui
+            and playerGui:FindFirstChild("MainGUI")
+            and playerGui.MainGUI:FindFirstChild("Game")
+            and playerGui.MainGUI.Game:FindFirstChild("Inventory")
+        local itemsContainer = inventory
+            and inventory:FindFirstChild("Main")
+            and inventory.Main:FindFirstChild("Weapons")
+            and inventory.Main.Weapons:FindFirstChild("Items")
+            and inventory.Main.Weapons.Items:FindFirstChild("Container")
+
+        if not itemsContainer then
+            return Values.options, 0
+        end
+
+        local found = {}
+        local totalValue = 0
+
+        local function collect(frame)
+            if frame:IsA("Frame") and frame.Name:match("NewItem") then
+                totalValue = totalValue + readInventoryItem(frame, found)
+            end
+        end
+
+        for _, tab in ipairs(itemsContainer:GetChildren()) do
+            if tab:IsA("ScrollingFrame") then
+                local tabContainer = tab:FindFirstChild("Container")
+                if tabContainer then
+                    for _, child in ipairs(tabContainer:GetChildren()) do
+                        if child:IsA("Frame") and child.Name:match("NewItem") then
+                            collect(child)
+                        elseif child:IsA("Frame") and child.Name ~= "UIGridLayout" and child.Name ~= "EventLayout" then
+                            local eventContainer = child:FindFirstChild("Container")
+                            if eventContainer then
+                                for _, eventChild in ipairs(eventContainer:GetChildren()) do
+                                    collect(eventChild)
+                                end
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        local sorted = {}
+        for itemLabel, quantity in pairs(found) do
+            local display = itemLabel
+            if quantity > 1 then
+                local namePart, restPart = itemLabel:match("^(.-)(%s*%[Val:.*)$")
+                if namePart and restPart then
+                    display = namePart .. " (x" .. tostring(quantity) .. ")" .. restPart
+                else
+                    display = itemLabel .. " (x" .. tostring(quantity) .. ")"
+                end
+            end
+            table.insert(sorted, display)
+        end
+
+        return Values.sortByValue(sorted), totalValue
+    end
+
+    local inventoryOptions, inventoryTotal = getInventoryOptions()
+
+    local yourInventoryDropdown = yourSection:Dropdown("Select From Inventory", {}, inventoryOptions, true, function(selected)
+        yourSelectedInventory = selected
+        recompute()
+    end, "Search your owned weapons", true)
+
+    local inventoryTotalLabel = yourSection:Label("Total Inventory Value: " .. comma(inventoryTotal))
+
+    yourSection:Button("Refresh Inventory", function()
+        local options, total = getInventoryOptions()
+        yourInventoryDropdown:UpdateChoices(options)
+        inventoryTotalLabel:SetText("Total Inventory Value: " .. comma(total))
+        Lib:Notify("Success", "Inventory refreshed! Total Value: " .. comma(total), 3, "success")
+    end)
+
+    local yourAllDropdown = yourSection:Dropdown("Select From All Items", {}, Values.options, true, function(selected)
+        yourSelectedAll = selected
+        recompute()
+    end, "Search any weapon", true)
+
+    yourSection:Button("Clear Your Offer", function()
+        yourInventoryDropdown:Set({})
+        yourAllDropdown:Set({})
+        yourSelectedInventory = {}
+        yourSelectedAll = {}
+        recompute()
+    end)
+
+    ----------------------------------------------------------------
+    -- Manual: their offer
+    ----------------------------------------------------------------
+
+    local theirDropdown = theirSection:Dropdown("Select Items", {}, Values.options, true, function(selected)
+        theirSelected = selected
+        recompute()
+    end, "Search and select their weapons", true)
+
+    theirSection:Button("Clear Their Offer", function()
+        theirDropdown:Set({})
+        theirSelected = {}
+        recompute()
+    end)
+
+    theirSection:Divider("Profile Scanner")
+
+    local function getProfileItems()
+        local detected = {}
+        local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+        local items = playerGui
+            and playerGui:FindFirstChild("MainGUI")
+            and playerGui.MainGUI:FindFirstChild("Game")
+            and playerGui.MainGUI.Game:FindFirstChild("ViewProfile")
+        items = items and items:FindFirstChild("Main")
+        items = items and items:FindFirstChild("Weapons")
+        items = items and items:FindFirstChild("Items")
+
+        if not items then
+            return detected
+        end
+
+        for _, child in ipairs(items:GetDescendants()) do
+            if child:IsA("Frame") and (child.Name:match("^NewItem") or child.Name:match("^Item_")) then
+                local nameFrame = child:FindFirstChild("ItemName")
+                local label = nameFrame and nameFrame:FindFirstChild("Label")
+                if label and label:IsA("TextLabel")
+                    and label.Text ~= "" and label.Text ~= "Label" and label.Text ~= "Loading..." then
+                    local name = ((label.Text or ""):gsub("<[^>]+>", "")):match("^%s*(.-)%s*$")
+                    if name and name ~= "" then
+                        name = name:lower():gsub("%s*x%s*%d+$", ""):gsub("%s*%(x%s*%d+%)$", "")
+                        table.insert(detected, withChromaPrefix(name, child))
+                    end
+                end
+            end
+        end
+
+        return detected
+    end
+
+    local scannedDropdown
+
+    theirSection:Button("Scan Opened Profile", function()
+        local detected = getProfileItems()
+
+        local matched = {}
+        for _, name in ipairs(detected) do
+            local label = Values.findLabel(name)
+            if label then
+                table.insert(matched, label)
+            end
+        end
+
+        if #detected == 0 then
+            scannedDropdown:UpdateChoices({})
+            scannedDropdown:Set({})
+            Lib:Notify("No items", "No items detected! Ensure you have someone's profile open and clicked 'Inventory'.", 3)
+        elseif #matched == 0 then
+            scannedDropdown:UpdateChoices({})
+            scannedDropdown:Set({})
+            Lib:Notify("No matches", "Profile items detected but they don't match the MM2 values list.", 3, "warning")
+        else
+            scannedDropdown:UpdateChoices(Values.sortByValue(matched))
+            scannedDropdown:Set({})
+            Lib:Notify("Success", "Scanned " .. tostring(#matched) .. " items! Check the dropdown below.", 3, "success")
+        end
+    end)
+
+    scannedDropdown = theirSection:Dropdown("Scanned Profile Items", {}, {}, true, function(selected)
+        local current = {}
+        local seen = {}
+
+        local existing = theirDropdown:Get()
+        if type(existing) == "table" then
+            for _, value in ipairs(existing) do
+                if not seen[value] then
+                    seen[value] = true
+                    table.insert(current, value)
+                end
+            end
+        elseif type(existing) == "string" and existing ~= "" then
+            seen[existing] = true
+            table.insert(current, existing)
+        end
+
+        local additions = type(selected) == "table" and selected or { selected }
+        for _, item in ipairs(additions) do
+            if type(item) == "string" and item ~= "" and not seen[item] then
+                seen[item] = true
+                table.insert(current, item)
+            end
+        end
+
+        theirDropdown:Set(current)
+        theirSelected = current
+        recompute()
+    end, "Select items to add to their offer", true)
+
+    theirSection:Button("Clear Scanned Items", function()
+        scannedDropdown:UpdateChoices({})
+        scannedDropdown:Set({})
+    end)
+
+    resultSection:Button("Clear All Tables", function()
+        yourInventoryDropdown:Set({})
+        yourAllDropdown:Set({})
+        theirDropdown:Set({})
+        yourSelectedInventory = {}
+        yourSelectedAll = {}
+        theirSelected = {}
+        recompute()
+    end)
+
+    tradeOpen = tradeGui.Enabled
+    recompute()
+end)
+
+--================================================================--
+--       MODULE: MISC (protection, role alerts, teleports)        --
+--                + the round timer overlay                       --
+--================================================================--
+
+defineModule("misc", function(Ctx)
+    local Lib = Ctx.Lib
+    local Players = Services.Players
+    local Workspace = Services.Workspace
+
+    local state = {
+        antiFling = false,
+        antiAfk = false,
+        roleAlerts = false,
+        roundTimer = false,
+    }
+
+    ----------------------------------------------------------------
+    -- Visuals: round timer
+    ----------------------------------------------------------------
+
+    local timerLabel = Util.newDrawing("Text", {
+        Visible = false,
+        Center = true,
+        Outline = true,
+        Font = 6, 
+        Size = 28,
+        Color = Color3.fromRGB(255, 215, 0),
+        Position = Vector2.new(500, 20),
+    })
+
+    local timerSection = Ctx.tabs.visuals:Section("UI & Timers", "Left")
+
+    timerSection:Toggle("Show Round Timer", false, function(enabled)
+        state.roundTimer = enabled
+        timerLabel.Visible = enabled
+    end)
+
+    timerSection:Colorpicker("Timer Color", Color3.fromRGB(255, 215, 0), function(color)
+        timerLabel.Color = color
+    end)
+
+    Scheduler.every("misc.roundTimer", 0.1, function()
+        if not state.roundTimer then
+            return
+        end
+
+        local camera = Workspace.CurrentCamera
+        if camera then
+            timerLabel.Position = Vector2.new(camera.ViewportSize.X / 2, 20)
+        end
+
+        local timerPart = Workspace:FindFirstChild("RoundTimerPart")
+        local surfaceGui = timerPart and timerPart:FindFirstChild("SurfaceGui")
+        local text = surfaceGui and surfaceGui:FindFirstChild("Timer")
+
+        if text and text.Text then
+            timerLabel.Text = "Time Left: " .. text.Text
+        else
+            timerLabel.Text = "Time Left: --:--"
+        end
+    end)
+
+    ----------------------------------------------------------------
+    -- Protection
+    ----------------------------------------------------------------
+
+    local protectionSection = Ctx.tabs.misc:Section("Protection", "Left")
+
+    local function setPlayersCollidable(collidable)
+        for _, player in ipairs(Players:GetPlayers()) do
+            local character = player ~= LocalPlayer and player.Character
+            if character then
+                for _, part in ipairs(character:GetChildren()) do
+                    if part:IsA("BasePart") then
+                        part.CanCollide = collidable
+                    elseif part:IsA("Accessory") then
+                        local handle = part:FindFirstChild("Handle")
+                        if handle and handle:IsA("BasePart") then
+                            handle.CanCollide = collidable
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    protectionSection:Toggle("Enable Anti-Fling", false, function(enabled)
+        state.antiFling = enabled
+        if enabled then
+            Lib:Notify("Protection", "Anti-Fling is now ON", 3, "success")
+        else
+            Lib:Notify("Protection", "Anti-Fling is now OFF", 3, "warning")
+            setPlayersCollidable(true)
+        end
+    end)
+
+    Scheduler.every("misc.antiFling", 0.2, function()
+        if state.antiFling then
+            setPlayersCollidable(false)
+        end
+    end)
+
+    local ANTI_AFK_KEYS = { 0x57, 0x41, 0x53, 0x44 } -- W A S D
+    local ANTI_AFK_PERIOD = 300
+    local lastAntiAfkTap = 0
+
+    protectionSection:Toggle("Enable Anti-AFK", false, function(enabled)
+        state.antiAfk = enabled
+        lastAntiAfkTap = os.clock()
+        Lib:Notify("Protection", "Anti-AFK is now " .. (enabled and "ON" or "OFF"), 3, enabled and "success" or "warning")
+    end)
+
+    math.randomseed(math.floor(os.clock() * 100000))
+
+    Scheduler.every("misc.antiAfk", 0.5, function()
+        if not state.antiAfk or (os.clock() - lastAntiAfkTap) < ANTI_AFK_PERIOD then
+            return
+        end
+        lastAntiAfkTap = os.clock()
+        -- tapKey holds the key for a moment, so it must not run on the
+        -- dispatcher thread.
+        task.spawn(Util.tapKey, ANTI_AFK_KEYS[math.random(1, #ANTI_AFK_KEYS)])
+    end)
+
+    ----------------------------------------------------------------
+    -- Role notifier
+    ----------------------------------------------------------------
+
+    local roleSection = Ctx.tabs.misc:Section("Role Notifier", "Left")
+
+    local currentMurderer, currentSheriff
+
+    roleSection:Toggle("Enable Role Alerts", false, function(enabled)
+        state.roleAlerts = enabled
+        if not enabled then
+            currentMurderer, currentSheriff = nil, nil
+        end
+    end)
+
+    Scheduler.every("misc.roleAlerts", 1, function()
+        if not state.roleAlerts then
+            return
+        end
+
+        local murderers, sheriffs = {}, {}
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player.Character then
+                local role = Util.getPlayerRole(player)
+                if role == "Murderer" then
+                    table.insert(murderers, player.Name)
+                elseif role == "Sheriff" then
+                    table.insert(sheriffs, player.Name)
+                end
+            end
+        end
+
+        local murdererNames = #murderers > 0 and table.concat(murderers, ", ") or nil
+        local sheriffNames = #sheriffs > 0 and table.concat(sheriffs, ", ") or nil
+
+        if murdererNames ~= currentMurderer then
+            currentMurderer = murdererNames
+            if currentMurderer then
+                Lib:Notify("Role Alert", "Murderer is: " .. currentMurderer, 5, "error")
+            end
+        end
+
+        if sheriffNames ~= currentSheriff then
+            currentSheriff = sheriffNames
+            if currentSheriff then
+                Lib:Notify("Role Alert", "Sheriff is: " .. currentSheriff, 5, "info")
+            end
+        end
+    end)
+
+    ----------------------------------------------------------------
+    -- Teleports
+    ----------------------------------------------------------------
+
+    local teleportSection = Ctx.tabs.misc:Section("Teleport", "Right")
+
+    local function getBounds(root)
+        if not root then
+            return nil, nil
+        end
+
+        if root:IsA("BasePart") then
+            return root.Position, root.Position.Y + (root.Size.Y * 0.5)
+        end
+
+        if root:IsA("Model") then
+            local ok, cframe, size = pcall(function()
+                return root:GetBoundingBox()
+            end)
+            if ok and cframe and size then
+                return cframe.Position, cframe.Position.Y + (size.Y * 0.5)
+            end
+        end
+
+        local min = Vector3.new(math.huge, math.huge, math.huge)
+        local max = Vector3.new(-math.huge, -math.huge, -math.huge)
         local found = false
 
         for _, part in ipairs(root:GetDescendants()) do
             if part:IsA("BasePart") then
                 found = true
                 local half = part.Size * 0.5
-                local low = part.Position - half
-                local high = part.Position + half
-                if low.X < minX then minX = low.X end
-                if low.Y < minY then minY = low.Y end
-                if low.Z < minZ then minZ = low.Z end
-                if high.X > maxX then maxX = high.X end
-                if high.Y > maxY then maxY = high.Y end
-                if high.Z > maxZ then maxZ = high.Z end
+                local low, high = part.Position - half, part.Position + half
+                min = Vector3.new(math.min(min.X, low.X), math.min(min.Y, low.Y), math.min(min.Z, low.Z))
+                max = Vector3.new(math.max(max.X, high.X), math.max(max.Y, high.Y), math.max(max.Z, high.Z))
             end
         end
 
@@ -2017,75 +2285,11 @@ pcall(function()
             return nil, nil
         end
 
-        local center = Vector3.new((minX + maxX) * 0.5, (minY + maxY) * 0.5, (minZ + maxZ) * 0.5)
-        return center, maxY
-    end
-
-    local function hasNameFragment(name, fragments)
-        local lowered = string.lower(name or "")
-        for _, fragment in ipairs(fragments) do
-            if string.find(lowered, fragment, 1, true) then
-                return true
-            end
-        end
-        return false
-    end
-
-    local function getSafeMapPosition(mapRoot)
-        if not mapRoot then return nil end
-
-        local mapCenter = nil
-        local mapTopY = nil
-        mapCenter, mapTopY = getBoundsInfo(mapRoot)
-        local minSafeY = mapCenter and (mapCenter.Y - 30) or -math.huge
-        local maxSafeY = mapTopY and (mapTopY - 2) or math.huge
-
-        local bestPart = nil
-        local bestScore = -math.huge
-        local blockedNameFragments = {
-            "barrier",
-            "boundary",
-            "blocker",
-            "invisible",
-            "kill",
-            "death",
-            "lava",
-            "void",
-            "roof",
-            "ceiling"
-        }
-
-        for _, part in ipairs(mapRoot:GetDescendants()) do
-            if part:IsA("BasePart")
-                and part.CanCollide
-                and part.Transparency < 1
-                and part.Size.X >= 4
-                and part.Size.Z >= 4
-                and part.Size.Y >= 0.5
-                and part.Position.Y >= minSafeY
-                and part.Position.Y <= maxSafeY
-                and not hasNameFragment(part.Name, blockedNameFragments) then
-                local areaScore = (part.Size.X * part.Size.Z)
-                local heightPenalty = mapCenter and math.abs(part.Position.Y - mapCenter.Y) or 0
-                local centerPenalty = mapCenter and ((Vector2.new(part.Position.X, part.Position.Z) - Vector2.new(mapCenter.X, mapCenter.Z)).Magnitude) or 0
-                local spawnBonus = hasNameFragment(part.Name, { "spawn", "start" }) and 40 or 0
-                local score = areaScore - (heightPenalty * 2) - (centerPenalty * 0.35) + spawnBonus
-                if score > bestScore then
-                    bestScore = score
-                    bestPart = part
-                end
-            end
-        end
-
-        if not bestPart then
-            return nil
-        end
-
-        return bestPart.Position + Vector3.new(0, (bestPart.Size.Y * 0.5) + 4, 0)
+        return (min + max) * 0.5, max.Y
     end
 
     local function getActiveMapRoot()
-        local normal = workspace:FindFirstChild("Normal")
+        local normal = Workspace:FindFirstChild("Normal")
         if normal then
             for _, map in ipairs(normal:GetChildren()) do
                 if (map:IsA("Model") or map:IsA("Folder")) and map:FindFirstChildWhichIsA("BasePart", true) then
@@ -2097,30 +2301,23 @@ pcall(function()
             end
         end
 
-        for _, obj in ipairs(workspace:GetChildren()) do
-            if obj:FindFirstChild("CoinContainer", true) then
-                return obj
+        for _, object in ipairs(Workspace:GetChildren()) do
+            if object:FindFirstChild("CoinContainer", true) then
+                return object
             end
         end
 
         return nil
     end
 
-    local function getActiveMapPart()
-        local mapRoot = getActiveMapRoot()
-        if not mapRoot then return nil end
-        if mapRoot:IsA("BasePart") then return mapRoot end
-        return mapRoot:FindFirstChildWhichIsA("BasePart", true)
-    end
-
     local function getLobbyRoot()
-        local lobby = workspace:FindFirstChild("Lobby")
+        local lobby = Workspace:FindFirstChild("Lobby")
         if lobby then
             return lobby
         end
-        for _, obj in ipairs(workspace:GetChildren()) do
-            if string.find(string.lower(obj.Name), "lobby") then
-                return obj
+        for _, object in ipairs(Workspace:GetChildren()) do
+            if string.find(string.lower(object.Name), "lobby") then
+                return object
             end
         end
         return nil
@@ -2128,2524 +2325,2324 @@ pcall(function()
 
     local function getLobbyFountainPosition()
         local lobby = getLobbyRoot()
-        if not lobby then return nil end
+        if not lobby then
+            return nil
+        end
 
-        local fountainRoot = nil
+        local fountain
         if string.find(string.lower(lobby.Name), "fountain") then
-            fountainRoot = lobby
+            fountain = lobby
         else
-            for _, obj in ipairs(lobby:GetDescendants()) do
-                if string.find(string.lower(obj.Name), "fountain") then
-                    fountainRoot = obj
+            for _, object in ipairs(lobby:GetDescendants()) do
+                if string.find(string.lower(object.Name), "fountain") then
+                    fountain = object
                     break
                 end
             end
         end
 
-        if fountainRoot then
-            local center, topY = getBoundsInfo(fountainRoot)
+        if fountain then
+            local center, topY = getBounds(fountain)
             if center and topY then
                 return Vector3.new(center.X, topY + 20, center.Z)
             end
         end
 
-        local fallbackPart = lobby:IsA("BasePart") and lobby or lobby:FindFirstChildWhichIsA("BasePart", true)
-        if fallbackPart then
-            return fallbackPart.Position + Vector3.new(0, 8, 0)
+        local fallback = lobby:IsA("BasePart") and lobby or lobby:FindFirstChildWhichIsA("BasePart", true)
+        if fallback then
+            return fallback.Position + Vector3.new(0, 8, 0)
         end
 
         return nil
     end
 
-    teleportSec:Button("Teleport to Lobby", function()
-        local hrp = getTeleportHRP()
-        if not hrp then return end
+    local function teleportTo(cframe)
+        local root = Util.getHRP()
+        if not root then
+            Lib:Notify("Teleport", "You have no character right now.", 3)
+            return false
+        end
+        root.CFrame = cframe
+        return true
+    end
 
-        local lobbyPos = getLobbyFountainPosition()
-        if not lobbyPos then
+    teleportSection:Button("Teleport to Lobby", function()
+        local position = getLobbyFountainPosition()
+        if not position then
             Lib:Notify("Teleport", "Lobby not found.", 3)
             return
         end
-
-        hrp.CFrame = CFrame.new(lobbyPos)
+        teleportTo(CFrame.new(position))
     end)
 
-    teleportSec:Button("Teleport to Murderer", function()
-        local hrp = getTeleportHRP()
-        if not hrp then return end
-
-        local targetPlayer, targetRoot = findRoleTargetPlayer("Knife")
-        if not targetRoot then
-            Lib:Notify("Teleport", "No active murderer found.", 3)
+    local function teleportToRole(toolName, roleLabel)
+        local player, root = Util.findPlayerWithTool(toolName)
+        if not root then
+            Lib:Notify("Teleport", "No active " .. roleLabel .. " found.", 3)
             return
         end
 
-        local targetPos = targetRoot.Position - (targetRoot.CFrame.LookVector * 3) + Vector3.new(0, 2, 0)
-        hrp.CFrame = CFrame.new(targetPos, targetRoot.Position)
-        Lib:Notify("Teleport", "Teleported to murderer: " .. targetPlayer.Name, 3)
-    end)
-
-    teleportSec:Button("Teleport to Sheriff", function()
-        local hrp = getTeleportHRP()
-        if not hrp then return end
-
-        local targetPlayer, targetRoot = findRoleTargetPlayer("Gun")
-        if not targetRoot then
-            Lib:Notify("Teleport", "No active sheriff found.", 3)
-            return
+        local behind = root.Position - (root.CFrame.LookVector * 3) + Vector3.new(0, 2, 0)
+        if teleportTo(CFrame.new(behind, root.Position)) then
+            Lib:Notify("Teleport", "Teleported to " .. roleLabel .. ": " .. player.Name, 3)
         end
+    end
 
-        local targetPos = targetRoot.Position - (targetRoot.CFrame.LookVector * 3) + Vector3.new(0, 2, 0)
-        hrp.CFrame = CFrame.new(targetPos, targetRoot.Position)
-        Lib:Notify("Teleport", "Teleported to sheriff: " .. targetPlayer.Name, 3)
+    teleportSection:Button("Teleport to Murderer", function()
+        teleportToRole("Knife", "murderer")
     end)
 
-    teleportSec:Button("Teleport Above Map", function()
-        local hrp = getTeleportHRP()
-        if not hrp then return end
+    teleportSection:Button("Teleport to Sheriff", function()
+        teleportToRole("Gun", "sheriff")
+    end)
 
+    teleportSection:Button("Teleport Above Map", function()
         local mapRoot = getActiveMapRoot()
         if not mapRoot then
             Lib:Notify("Teleport", "No active map found.", 3)
             return
         end
 
-        local center, topY = getBoundsInfo(mapRoot)
+        local center, topY = getBounds(mapRoot)
         if center and topY then
-            hrp.CFrame = CFrame.new(center.X, topY + 60, center.Z)
+            teleportTo(CFrame.new(center.X, topY + 60, center.Z))
             return
         end
 
-        local mapPart = getActiveMapPart()
-        if not mapPart then
+        local part = mapRoot:IsA("BasePart") and mapRoot or mapRoot:FindFirstChildWhichIsA("BasePart", true)
+        if not part then
             Lib:Notify("Teleport", "No active map found.", 3)
             return
         end
 
-        hrp.CFrame = CFrame.new(mapPart.Position + Vector3.new(0, 60, 0))
+        teleportTo(CFrame.new(part.Position + Vector3.new(0, 60, 0)))
     end)
+
 end)
 
 --================================================================--
---            VISUALS: GUN & TRAP ESP / ROLE ESP                  --
+--          MODULE: ESP (role highlights, gun drop, traps)        --
 --================================================================--
 
-local miscSec = visualsTab:Section("Gun & Trap ESP", "Left")
+defineModule("esp", function(Ctx)
+    local Lib = Ctx.Lib
+    local Players = Services.Players
+    local Workspace = Services.Workspace
+    local worldToScreen = Util.worldToScreen
 
-local GunESPEnabled = false
-local ESP_Objects = {}
+    local state = {
+        gun = false,
+        trap = false,
+        innocent = false,
+        sheriff = false,
+        murderer = false,
+    }
 
-local Workspace = game:GetService("Workspace")
-local Players = game:GetService("Players")
-local RunService = game:GetService("RunService")
-local LocalPlayer = Players.LocalPlayer
+    local espSection = Ctx.tabs.visuals:Section("Gun & Trap ESP", "Left")
+    local roleSection = Ctx.tabs.visuals:Section("Role ESP", "Right")
 
-local roleEspSec = visualsTab:Section("Role ESP", "Right")
-local InnocentESPEnabled = false
-local SheriffESPEnabled = false
-local MurdererESPEnabled = false
-local RoleESP_Highlights = {}
+    ----------------------------------------------------------------
+    -- Role ESP
+    ----------------------------------------------------------------
 
-local ROLE_ESP_COLORS = {
-    Innocent = Color3.fromRGB(255, 255, 255),
-    Sheriff = Color3.fromRGB(0, 0, 255),
-    Murderer = Color3.fromRGB(255, 0, 0)
-}
+    local ROLE_COLORS = {
+        Innocent = Color3.fromRGB(255, 255, 255),
+        Sheriff = Color3.fromRGB(0, 0, 255),
+        Murderer = Color3.fromRGB(255, 0, 0),
+    }
 
-local function hasRoleTool(container, toolName)
-    if not container then return false end
-    for _, item in ipairs(container:GetChildren()) do
-        if item:IsA("Tool") and item.Name == toolName then
-            return true
-        end
-    end
-    return false
-end
+    local ROLE_ENABLED_KEY = {
+        Innocent = "innocent",
+        Sheriff = "sheriff",
+        Murderer = "murderer",
+    }
 
-local function getPlayerRoleForESP(player)
-    if not player then return nil end
-    local char = player.Character
-    local backpack = player:FindFirstChildOfClass("Backpack")
+    local highlights = {}
 
-    if hasRoleTool(char, "Knife") or hasRoleTool(backpack, "Knife") then
-        return "Murderer"
-    end
-    if hasRoleTool(char, "Gun") or hasRoleTool(backpack, "Gun") then
-        return "Sheriff"
-    end
-    return "Innocent"
-end
-
-local function clearRoleESPForPlayer(player)
-    local highlight = RoleESP_Highlights[player]
-    if highlight then
-        highlight:Destroy()
-        RoleESP_Highlights[player] = nil
-    end
-end
-
-local function clearAllRoleESP()
-    for player, highlight in pairs(RoleESP_Highlights) do
+    local function clearRoleESP(player)
+        local highlight = highlights[player]
         if highlight then
             highlight:Destroy()
-        end
-        RoleESP_Highlights[player] = nil
-    end
-end
-
-local function shouldRenderRoleESP(role)
-    if role == "Murderer" then
-        return MurdererESPEnabled
-    elseif role == "Sheriff" then
-        return SheriffESPEnabled
-    elseif role == "Innocent" then
-        return InnocentESPEnabled
-    end
-    return false
-end
-
-local function updateRoleESPForPlayer(player)
-    if player == LocalPlayer then
-        clearRoleESPForPlayer(player)
-        return
-    end
-
-    local char = player.Character
-    if not char or not char.Parent then
-        clearRoleESPForPlayer(player)
-        return
-    end
-
-    local humanoid = char:FindFirstChildOfClass("Humanoid")
-    if humanoid and humanoid.Health <= 0 then
-        clearRoleESPForPlayer(player)
-        return
-    end
-
-    local role = getPlayerRoleForESP(player)
-    if not shouldRenderRoleESP(role) then
-        clearRoleESPForPlayer(player)
-        return
-    end
-
-    local color = ROLE_ESP_COLORS[role] or ROLE_ESP_COLORS.Innocent
-    local highlight = RoleESP_Highlights[player]
-    if not highlight or not highlight.Parent then
-        highlight = Instance.new("Highlight")
-        highlight.Name = "MM2RoleESP"
-        highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-        highlight.FillTransparency = 0.7
-        highlight.OutlineTransparency = 0
-        RoleESP_Highlights[player] = highlight
-    end
-
-    highlight.Adornee = char
-    highlight.FillColor = color
-    highlight.OutlineColor = color
-    if highlight.Parent ~= char then
-        highlight.Parent = char
-    end
-end
-
-local function refreshAllRoleESP()
-    for player in pairs(RoleESP_Highlights) do
-        if not player or player.Parent ~= Players then
-            clearRoleESPForPlayer(player)
+            highlights[player] = nil
         end
     end
 
-    for _, player in ipairs(Players:GetPlayers()) do
-        updateRoleESPForPlayer(player)
+    local function clearAllRoleESP()
+        for player in pairs(highlights) do
+            clearRoleESP(player)
+        end
     end
-end
 
-roleEspSec:Toggle("Innocents ESP", false, function(state)
-    InnocentESPEnabled = state
-    refreshAllRoleESP()
-end)
+    local function updateRoleESP(player)
+        local character = player ~= LocalPlayer and player.Character
+        if not character or not character.Parent or not Util.isAlive(player) then
+            clearRoleESP(player)
+            return
+        end
 
-roleEspSec:Toggle("Sheriff ESP", false, function(state)
-    SheriffESPEnabled = state
-    refreshAllRoleESP()
-end)
+        local role = Util.getPlayerRole(player)
+        if not state[ROLE_ENABLED_KEY[role]] then
+            clearRoleESP(player)
+            return
+        end
 
-roleEspSec:Toggle("Murderer ESP", false, function(state)
-    MurdererESPEnabled = state
-    refreshAllRoleESP()
-end)
+        local color = ROLE_COLORS[role] or ROLE_COLORS.Innocent
+        local highlight = highlights[player]
+        if not highlight or not highlight.Parent then
+            highlight = Instance.new("Highlight")
+            highlight.Name = "MM2RoleESP"
+            highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+            highlight.FillTransparency = 0.7
+            highlight.OutlineTransparency = 0
+            highlights[player] = highlight
+        end
 
-Players.PlayerRemoving:Connect(function(player)
-    clearRoleESPForPlayer(player)
-end)
+        highlight.Adornee = character
+        highlight.FillColor = color
+        highlight.OutlineColor = color
+        if highlight.Parent ~= character then
+            highlight.Parent = character
+        end
+    end
 
-task.spawn(function()
-    while true do
-        if InnocentESPEnabled or SheriffESPEnabled or MurdererESPEnabled then
+    local function refreshAllRoleESP()
+        for player in pairs(highlights) do
+            if not player or player.Parent ~= Players then
+                clearRoleESP(player)
+            end
+        end
+
+        for _, player in ipairs(Players:GetPlayers()) do
+            updateRoleESP(player)
+        end
+    end
+
+    roleSection:Toggle("Innocents ESP", false, function(enabled)
+        state.innocent = enabled
+        refreshAllRoleESP()
+    end)
+
+    roleSection:Toggle("Sheriff ESP", false, function(enabled)
+        state.sheriff = enabled
+        refreshAllRoleESP()
+    end)
+
+    roleSection:Toggle("Murderer ESP", false, function(enabled)
+        state.murderer = enabled
+        refreshAllRoleESP()
+    end)
+
+    Session.track(Players.PlayerRemoving:Connect(clearRoleESP))
+
+    Scheduler.every("esp.roles", 0.2, function()
+        if state.innocent or state.sheriff or state.murderer then
             refreshAllRoleESP()
-            task.wait(0.2)
-        else
-            if next(RoleESP_Highlights) then
-                clearAllRoleESP()
-            end
-            task.wait(0.4)
+        elseif next(highlights) then
+            clearAllRoleESP()
         end
-    end
-end)
+    end)
 
-local GunDropPart = nil
-local GunDropPartPosition = nil
-local SavedHrp = nil
-local DistanceTextCache = ""
+    ----------------------------------------------------------------
+    -- Gun drop ESP
+    ----------------------------------------------------------------
 
-local Vector2New = Vector2.new
-local OffsetUp = Vector2New(10, -16)
-local OffsetDown = Vector2New(10, 22)
+    local GUN_MAX_DISTANCE = 1000
+    local GUN_BOX_SIZE = Vector2.new(20, 20)
+    local LABEL_OFFSET_UP = Vector2.new(10, -16)
+    local LABEL_OFFSET_DOWN = Vector2.new(10, 22)
 
-local Square = (Drawing and Drawing.new or function() return {} end)("Square")
-local GunLabel = (Drawing and Drawing.new or function() return {} end)("Text")
-local DistanceLabel = (Drawing and Drawing.new or function() return {} end)("Text")
+    local gunColor = Color3.fromRGB(0, 255, 0)
 
-ESP_Objects.Square = Square
-ESP_Objects.GunLabel = GunLabel
-ESP_Objects.DistanceLabel = DistanceLabel
+    local gunBox = Util.newDrawing("Square", {
+        Color = gunColor,
+        Size = GUN_BOX_SIZE,
+        Visible = false,
+    })
 
-Square.Color = Color3.fromRGB(0, 255, 0)
-Square.Size = Vector2New(20, 20)
-Square.Visible = false
+    local gunLabel = Util.newDrawing("Text", {
+        Color = gunColor,
+        Font = Util.drawingFont("ProximaSoftBold"),
+        Size = 16,
+        Text = "GunDrop",
+        Center = true,
+        Outline = true,
+        Visible = false,
+    })
 
-GunLabel.Color = Color3.fromRGB(0, 255, 0)
-GunLabel.Font = (Drawing and Drawing.Fonts or {}).ProximaSoftBold or 0
-GunLabel.Size = 16
-GunLabel.Text = "GunDrop"
-GunLabel.Center = true
-GunLabel.Outline = true
-GunLabel.Visible = false
+    local gunDistanceLabel = Util.newDrawing("Text", {
+        Color = gunColor,
+        Font = Util.drawingFont("ProximaSoftBold"),
+        Size = 14,
+        Text = "",
+        Center = true,
+        Outline = true,
+        Visible = false,
+    })
 
-DistanceLabel.Color = Color3.fromRGB(0, 255, 0)
-DistanceLabel.Font = (Drawing and Drawing.Fonts or {}).ProximaSoftBold or 0
-DistanceLabel.Size = 14
-DistanceLabel.Text = ""
-DistanceLabel.Center = true
-DistanceLabel.Outline = true
-DistanceLabel.Visible = false
+    local gunDrop, gunDropPosition
+    local gunDistance, gunDistanceText = math.huge, ""
+    local gunDropNotified = false
 
-local SquareSize = Square.Size
-local Camera = Workspace.CurrentCamera
-
-local CustomW2S = type(WorldToScreen) == "function" and WorldToScreen or function(pos)
-    local sp, os = Camera:WorldToViewportPoint(pos)
-    return Vector2New(sp.X, sp.Y), os
-end
-
-local function GetGunDrop()
-    if GunDropPart and GunDropPart.Parent then
-        pcall(function() GunDropPartPosition = GunDropPart.Position end)
-        return
+    local function hideGunESP()
+        gunBox.Visible = false
+        gunLabel.Visible = false
+        gunDistanceLabel.Visible = false
     end
 
-    local Found = false
-    local g = workspace:FindFirstChild("GunDrop")
-    if g and g:IsA("BasePart") then
-        GunDropPart = g; Found = true
-    else
-        for _, v in ipairs(workspace:GetChildren()) do
-            if (v:IsA("Model") or v:IsA("Folder")) and not v:FindFirstChild("Humanoid") then
-                g = v:FindFirstChild("GunDrop")
-                if g and g:IsA("BasePart") then
-                    GunDropPart = g; Found = true; break
-                end
-                if v.Name == "Normal" then
-                    for _, map in ipairs(v:GetChildren()) do
-                        local mg = map:FindFirstChild("GunDrop")
-                        if mg and mg:IsA("BasePart") then
-                            GunDropPart = mg; Found = true; break
-                        end
-                    end
-                end
-            end
-            if Found then break end
+    espSection:Toggle("Enable Gun ESP", false, function(enabled)
+        state.gun = enabled
+        if not enabled then
+            hideGunESP()
         end
-    end
+    end)
 
-    if Found then
-        pcall(function() GunDropPartPosition = GunDropPart.Position end)
-        if ESP_Objects and not ESP_Objects.GunDroppedNotified then
-            ESP_Objects.GunDroppedNotified = true
+    espSection:Colorpicker("Gun ESP Color", gunColor, function(color)
+        gunColor = color
+        gunBox.Color = color
+        gunLabel.Color = color
+        gunDistanceLabel.Color = color
+    end)
+
+    Scheduler.every("esp.gunScan", 0.3, function()
+        if not state.gun then
+            return
+        end
+
+        if not (gunDrop and gunDrop.Parent) then
+            gunDrop = Util.findGunDrop()
+        end
+
+        if not gunDrop then
+            gunDropPosition = nil
+            gunDistance = math.huge
+            gunDropNotified = false
+            hideGunESP()
+            return
+        end
+
+        if not gunDropNotified then
+            gunDropNotified = true
             Lib:Notify("Gun Dropped!", "The Sheriff's gun is on the ground!", 4, "warning")
         end
-    else
-        GunDropPart = nil
-        GunDropPartPosition = nil
-        Square.Visible = false
-        GunLabel.Visible = false
-        DistanceLabel.Visible = false
-        if ESP_Objects then ESP_Objects.GunDroppedNotified = false end
-    end
-end
 
-local function UpdateHrp()
-    local Character = LocalPlayer.Character
-    local Hrp = Character and Character.PrimaryPart
-    SavedHrp = Hrp or nil
-end
+        gunDropPosition = gunDrop.Position
 
-local MaxDistance = 1000
-local CachedDistanceNumber = 0
-
-task.spawn(function()
-    while true do
-        if GunESPEnabled then
-            GetGunDrop()
-            UpdateHrp()
-            
-            if GunDropPart and SavedHrp and GunDropPartPosition then
-                pcall(function()
-                    local Distance = (SavedHrp.Position - GunDropPartPosition).Magnitude
-                    CachedDistanceNumber = Distance
-                    DistanceTextCache = string.format("%.1f studs", Distance)
-                end)
-            else
-                CachedDistanceNumber = 9999
-            end
-        end
-        task.wait(0.3)
-    end
-end)
-
-RunService.RenderStepped:Connect(function()
-    if not GunESPEnabled or not GunDropPart or not GunDropPart.Parent or not SavedHrp or not SavedHrp.Parent or not GunDropPartPosition or CachedDistanceNumber > MaxDistance then 
-        Square.Visible = false
-        GunLabel.Visible = false
-        DistanceLabel.Visible = false
-        return 
-    end
-    
-    local pos = nil
-    pcall(function()
-        pos = GunDropPart.Position
-    end)
-    
-    if not GunDropPart or not GunDropPart.Parent or not pos then
-        Square.Visible = false
-        GunLabel.Visible = false
-        DistanceLabel.Visible = false
-        return
-    end
-    
-    local Position, OnScreen = CustomW2S(pos)
-    
-    if not OnScreen then 
-        Square.Visible = false
-        GunLabel.Visible = false
-        DistanceLabel.Visible = false
-        return 
-    end
-    local Pos2D = Vector2New(Position.X, Position.Y)
-
-    local BoxPosition = Pos2D - SquareSize
-    Square.Position = BoxPosition
-    Square.Visible = true
-
-    GunLabel.Position = BoxPosition + OffsetUp
-    GunLabel.Visible = true
-
-    DistanceLabel.Text = DistanceTextCache
-    DistanceLabel.Position = BoxPosition + OffsetDown
-    DistanceLabel.Visible = true
-end)
-
-miscSec:Toggle("Enable Gun ESP", false, function(state)
-    GunESPEnabled = state
-    if not state then
-        Square.Visible = false
-        GunLabel.Visible = false
-        DistanceLabel.Visible = false
-    end
-end)
-
-miscSec:Colorpicker("Gun ESP Color", Color3.fromRGB(0, 255, 0), function(color)
-    if ESP_Objects then
-        ESP_Objects.Square.Color = color
-        ESP_Objects.GunLabel.Color = color
-        ESP_Objects.DistanceLabel.Color = color
-    end
-    _G.CurrentGunESPColor = color
-end)
-
-miscSec:Colorpicker("Trap ESP Color", Color3.fromRGB(255, 50, 50), function(color)
-    if TrapESP_Objects then
-        for _, objs in pairs(TrapESP_Objects) do
-            if objs.Square then objs.Square.Color = color end
-            if objs.Label then objs.Label.Color = color end
-            if objs.Dist then objs.Dist.Color = color end
-        end
-    end
-    _G.CurrentTrapESPColor = color
-end)
-
-local TrapESPEnabled = false
-local TrapESP_Objects = {}
-local CachedTraps = {}
-
-local function ClearTrapESP()
-    for trap, objs in pairs(TrapESP_Objects) do
-        if objs.Square then objs.Square:Remove() end
-        if objs.Label then objs.Label:Remove() end
-        if objs.Dist then objs.Dist:Remove() end
-    end
-    TrapESP_Objects = {}
-    CachedTraps = {}
-end
-
-miscSec:Toggle("Enable Trap ESP", false, function(state)
-    TrapESPEnabled = state
-    if not state then
-        ClearTrapESP()
-    end
-end)
-
-
-task.spawn(function()
-    while true do
-        if TrapESPEnabled then
-            local newTraps = {}
-            for _, v in ipairs(workspace:GetChildren()) do
-                if v.Name == "Trap" or string.find(v.Name, "HiddenTrap") then
-                    local p = v:IsA("BasePart") and v or v:FindFirstChildWhichIsA("BasePart")
-                    if p then table.insert(newTraps, p) end
-                end
-                if v.Name == "Normal" then
-                    for _, mapFolder in ipairs(v:GetChildren()) do
-                        if mapFolder.Name == "Trap" or string.find(mapFolder.Name, "HiddenTrap") then
-                            local p = mapFolder:IsA("BasePart") and mapFolder or mapFolder:FindFirstChildWhichIsA("BasePart")
-                            if p then table.insert(newTraps, p) end
-                        else
-                            for _, sub in ipairs(mapFolder:GetChildren()) do
-                                if sub.Name == "Trap" or string.find(sub.Name, "HiddenTrap") then
-                                    local p = sub:IsA("BasePart") and sub or sub:FindFirstChildWhichIsA("BasePart")
-                                    if p then table.insert(newTraps, p) end
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-            CachedTraps = newTraps
-        end
-        task.wait(0.5)
-    end
-end)
-
-RunService.RenderStepped:Connect(function()
-    if not TrapESPEnabled then return end
-    
-    local trapMap = {}
-    for _, t in ipairs(CachedTraps) do
-        if t and t.Parent then
-            trapMap[t] = true
-        end
-    end
-    
-    for t, objs in pairs(TrapESP_Objects) do
-        if not trapMap[t] then
-            if objs.Square then objs.Square:Remove() end
-            if objs.Label then objs.Label:Remove() end
-            if objs.Dist then objs.Dist:Remove() end
-            TrapESP_Objects[t] = nil
-        end
-    end
-    
-    local hrp = nil
-    if LocalPlayer.Character then
-        hrp = LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-    end
-    local cam = workspace.CurrentCamera
-    if not cam then return end
-    
-    for t, _ in pairs(trapMap) do
-        if not TrapESP_Objects[t] then
-            local sq = (Drawing and Drawing.new or function() return {} end)("Square")
-            sq.Color = _G.CurrentTrapESPColor or Color3.fromRGB(255, 50, 50)
-            sq.Size = Vector2.new(20, 20)
-            
-            local lbl = (Drawing and Drawing.new or function() return {} end)("Text")
-            lbl.Color = _G.CurrentTrapESPColor or Color3.fromRGB(255, 50, 50)
-            lbl.Font = (Drawing and Drawing.Fonts or {}).UI or 0
-            lbl.Size = 15
-            lbl.Text = "TRAP"
-            lbl.Center = true
-            lbl.Outline = true
-            
-            local distLbl = (Drawing and Drawing.new or function() return {} end)("Text")
-            distLbl.Color = _G.CurrentTrapESPColor or Color3.fromRGB(255, 50, 50)
-            distLbl.Font = (Drawing and Drawing.Fonts or {}).UI or 0
-            distLbl.Size = 13
-            distLbl.Center = true
-            distLbl.Outline = true
-            
-            TrapESP_Objects[t] = {Square = sq, Label = lbl, Dist = distLbl}
-        end
-        
-        local objs = TrapESP_Objects[t]
-        
-        local CustomW2S = type(WorldToScreen) == "function" and WorldToScreen or function(pos)
-            local sp, os = cam:WorldToViewportPoint(pos)
-            return Vector2.new(sp.X, sp.Y), os
-        end
-        
-        local pos = nil
-        pcall(function()
-            pos = t.Position
-        end)
-        
-        if pos then
-            local pos2dRaw, onScreen = CustomW2S(pos)
-            
-            if onScreen then
-                local pos2d = Vector2.new(pos2dRaw.X, pos2dRaw.Y)
-                objs.Square.Position = pos2d - (objs.Square.Size / 2)
-                objs.Square.Visible = true
-                
-                objs.Label.Position = pos2d - Vector2.new(0, 18)
-                objs.Label.Visible = true
-                
-                if hrp then
-                    local d = (hrp.Position - pos).Magnitude
-                    objs.Dist.Text = string.format("%.1f", d)
-                    objs.Dist.Position = pos2d + Vector2.new(0, 10)
-                    objs.Dist.Visible = true
-                else
-                    objs.Dist.Visible = false
-                end
-            else
-                objs.Square.Visible = false
-                objs.Label.Visible = false
-                objs.Dist.Visible = false
-            end
+        local root = Util.getHRP()
+        if root then
+            gunDistance = (root.Position - gunDropPosition).Magnitude
+            gunDistanceText = string.format("%.1f studs", gunDistance)
         else
-            objs.Square.Visible = false
-            objs.Label.Visible = false
-            objs.Dist.Visible = false
+            gunDistance = math.huge
         end
-    end
-end)
+    end)
 
---================================================================--
---          COMBAT: AUTO GET GUN / KILL ALL / KNIFE AURA          --
---================================================================--
-
-local combatSec = combatTab:Section("Combat", "Left")
-
-local AutoGetGunEnabled = false
-
-local function GrabGunNow(isAuto)
-    local Workspace = game:GetService("Workspace")
-    local LocalPlayer = game:GetService("Players").LocalPlayer
-    local Character = LocalPlayer.Character
-    if not Character then return end
-    local Hrp = Character:FindFirstChild("HumanoidRootPart")
-    if not Hrp then return end
-
-    local gunDrop = nil
-    
-    local p = workspace:FindFirstChild("GunDrop")
-    if p and p:IsA("BasePart") then gunDrop = p end
-    
-    if not gunDrop then
-        for _, v in ipairs(workspace:GetChildren()) do
-            if (v:IsA("Model") or v:IsA("Folder")) and not v:FindFirstChild("Humanoid") then
-                local g = v:FindFirstChild("GunDrop")
-                if g and g:IsA("BasePart") then
-                    gunDrop = g
-                    break
-                end
-                
-                if v.Name == "Normal" then
-                    for _, map in ipairs(v:GetChildren()) do
-                        local mg = map:FindFirstChild("GunDrop")
-                        if mg and mg:IsA("BasePart") then
-                            gunDrop = mg
-                            break
-                        end
-                    end
-                end
-            end
-            if gunDrop then break end
+    Scheduler.onRender("esp.gunDraw", function()
+        if not state.gun
+            or not gunDrop
+            or not gunDrop.Parent
+            or not gunDropPosition
+            or gunDistance > GUN_MAX_DISTANCE then
+            hideGunESP()
+            return
         end
+
+        local position, onScreen = worldToScreen(gunDrop.Position)
+        if not onScreen then
+            hideGunESP()
+            return
+        end
+
+        local corner = position - GUN_BOX_SIZE
+        gunBox.Position = corner
+        gunBox.Visible = true
+
+        gunLabel.Position = corner + LABEL_OFFSET_UP
+        gunLabel.Visible = true
+
+        gunDistanceLabel.Text = gunDistanceText
+        gunDistanceLabel.Position = corner + LABEL_OFFSET_DOWN
+        gunDistanceLabel.Visible = true
+    end)
+
+    ----------------------------------------------------------------
+    -- Trap ESP
+    ----------------------------------------------------------------
+
+    local TRAP_BOX_SIZE = Vector2.new(20, 20)
+
+    local trapColor = Color3.fromRGB(255, 50, 50)
+    local trapDrawings = {}
+    local trapParts = {}
+
+    local function isTrapNamed(name)
+        return name == "Trap" or string.find(name, "HiddenTrap") ~= nil
     end
 
-    if not gunDrop then 
-        if not isAuto then
-            Lib:Notify("Not Found", "No dropped gun found on the map!", 3)
-        end
-        return false
-    end
-    
-    if isAuto then
-        local dist = (Hrp.Position - gunDrop.Position).Magnitude
-        
-        if dist > 1000 then
+    local function collectTrap(object, out)
+        if not isTrapNamed(object.Name) then
             return false
         end
-    end
-    
-
-    local oldCFrame = Hrp.CFrame
-    
-    
-    Hrp.CFrame = gunDrop.CFrame
-    
-    
-    task.wait()
-    
-    
-    if Hrp then
-        Hrp.CFrame = oldCFrame
-    end
-    
-    return true
-end
-
-combatSec:Toggle("Auto Get Gun", false, function(state)
-    AutoGetGunEnabled = state
-end)
-
-
-combatSec:Button("Teleport to Dropped Gun", function()
-    GrabGunNow(false)
-end)
-
-local isGetGunKeybindEnabled = false
-local getGunKeyToggle = combatSec:Toggle("Get Gun (Hotkey)", false, function(state)
-    isGetGunKeybindEnabled = state
-end)
-getGunKeyToggle:AddKeybind("g", "Hold", function(active)
-    if active and isGetGunKeybindEnabled then
-        task.spawn(function()
-            GrabGunNow(false)
-        end)
-    end
-end)
-
-task.spawn(function()
-    while true do
-        if AutoGetGunEnabled then
-            local hasGunAlready = false
-            local isMurderer = false
-            pcall(function()
-                local lp = game:GetService("Players").LocalPlayer
-                local c = lp.Character
-                local bp = lp:FindFirstChild("Backpack")
-                local function gotGun(con)
-                    return con and con:FindFirstChild("Gun") ~= nil
-                end
-                local function gotKnife(con)
-                    return con and con:FindFirstChild("Knife") ~= nil
-                end
-                hasGunAlready = gotGun(c) or gotGun(bp)
-                isMurderer = gotKnife(c) or gotKnife(bp)
-            end)
-
-            if not hasGunAlready and not isMurderer then
-                local attempted = GrabGunNow(true)
-                if attempted then
-                    task.wait(1.5)
-                end
-            end
+        local part = object:IsA("BasePart") and object or object:FindFirstChildWhichIsA("BasePart")
+        if part then
+            table.insert(out, part)
         end
-        task.wait(0.1)
-    end
-end)
-
-local doAutoKillActive = false
-local function doAutoKill(ignoreLimit)
-    if doAutoKillActive then return end
-    local char = LocalPlayer.Character
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    if not hrp then return end
-
-    local knife = nil
-    local function getKnife(c)
-        if not c then return nil end
-        
-        return c:FindFirstChild("Knife")
+        return true
     end
 
-    knife = getKnife(char) or getKnife(LocalPlayer:FindFirstChild("Backpack"))
-    if not knife then
-        Lib:Notify("Auto Kill", "You must be the Murderer (Knife not found)!", 3, "error")
-        doAutoKillActive = false
-        return
-    end
-
-    
-    local function forceEquipKnife()
-        if knife and knife.Parent ~= char then
-            local hum = char:FindFirstChild("Humanoid")
-            if hum then
-                
-                pcall(keypress, 0x31)
-                task.wait(0.05)
-                pcall(keyrelease, 0x31)
-            else
-                knife.Parent = char
-            end
+    local function clearTrapESP()
+        for _, drawings in pairs(trapDrawings) do
+            drawings.box:Remove()
+            drawings.label:Remove()
+            drawings.distance:Remove()
         end
+        trapDrawings = {}
+        trapParts = {}
     end
-    
-    forceEquipKnife()
-    
-    
-    task.wait(0.5)
-    task.wait(0.2)
-    
-    local spamming = true
 
-    local function getAlivePlayers()
-        local plrs = {}
-        for _, p in ipairs(game:GetService("Players"):GetPlayers()) do
-            if p ~= LocalPlayer and p.Character then
-                local eHum = p.Character:FindFirstChild("Humanoid")
-                local eHrp = p.Character:FindFirstChild("HumanoidRootPart")
-                if eHum and eHrp and eHum.Health > 0 and p.Name ~= LocalPlayer.Name then
-                    local dist = (hrp.Position - eHrp.Position).Magnitude
-                    if ignoreLimit or dist <= 500 then
-                        table.insert(plrs, p)
-                    end
-                end
-            end
+    espSection:Colorpicker("Trap ESP Color", trapColor, function(color)
+        trapColor = color
+        for _, drawings in pairs(trapDrawings) do
+            drawings.box.Color = color
+            drawings.label.Color = color
+            drawings.distance.Color = color
         end
-        return plrs
-    end
+    end)
 
-    local targets = getAlivePlayers()
-    if #targets == 0 then
-        Lib:Notify("Auto Kill", "No targets found!", 3)
-        return
-    end
-
-    doAutoKillActive = true
-    Lib:Notify("Auto Kill", "Starting! Eradicating " .. #targets .. " players.", 3, "warning")
-
-    local maxAttempts = 50 
-    local attempts = 0
-    
-    while doAutoKillActive and attempts < maxAttempts do
-        if not char or not hrp or not hrp.Parent then break end
-        
-        local cam = workspace.CurrentCamera
-        local lookDir = cam.CFrame.LookVector
-        lookDir = Vector3.new(lookDir.X, 0, lookDir.Z).Unit
-        
-        local bringPos = hrp.Position + (lookDir * 3.5) 
-        local bringCF = CFrame.lookAt(bringPos, hrp.Position)
-        
-        pcall(function()
-            hrp.CFrame = CFrame.lookAt(hrp.Position, Vector3.new(bringPos.X, hrp.Position.Y, bringPos.Z))
-        end)
-        
-        local anyoneAlive = false
-        for _, target in ipairs(targets) do
-            local tChar = target.Character
-            local tHrp = tChar and tChar:FindFirstChild("HumanoidRootPart")
-            local tHum = tChar and tChar:FindFirstChild("Humanoid")
-            
-            if tHrp and tHum and tHum.Health > 0 then
-                anyoneAlive = true
-                pcall(function()
-                    tHrp.CFrame = bringCF
-                    tHrp.AssemblyLinearVelocity = Vector3.zero
-                    tHrp.AssemblyAngularVelocity = Vector3.zero
-                end)
-            end
+    espSection:Toggle("Enable Trap ESP", false, function(enabled)
+        state.trap = enabled
+        if not enabled then
+            clearTrapESP()
         end
-        
-        if not anyoneAlive then
-            break
+    end)
+
+    Scheduler.every("esp.trapScan", 0.5, function()
+        if not state.trap then
+            return
         end
-        
-        pcall(function() mouse1click() end)
-        pcall(function() if knife then knife:Activate() end end)
-        
-        task.wait(0.05)
-        attempts = attempts + 1
-    end
-    
-    spamming = false
-    doAutoKillActive = false
-    Lib:Notify("Auto Kill", "Eradication Complete!", 3, "success")
-end
 
-combatSec:Button("Kill All (Button)", function()
-    task.spawn(doAutoKill)
-end)
+        local found = {}
+        for _, child in ipairs(Workspace:GetChildren()) do
+            collectTrap(child, found)
 
-local isKillKeybindEnabled = false
-local killKeyToggle = combatSec:Toggle("Kill All (Hotkey)", false, function(state)
-    isKillKeybindEnabled = state
-end)
-killKeyToggle:AddKeybind("k", "Hold", function(active)
-    if active and isKillKeybindEnabled then
-        task.spawn(doAutoKill)
-    end
-end)
-
-local AutoKillAllEnabled = false
-combatSec:Toggle("Auto Kill All (Loop)", false, function(state)
-    AutoKillAllEnabled = state
-    if state then
-        Lib:Notify("Auto Kill", "Auto Kill All loop started!", 3, "success")
-    end
-end)
-
-task.spawn(function()
-    while true do
-        if AutoKillAllEnabled then
-            pcall(doAutoKill)
-            task.wait(1)
-        else
-            task.wait(0.5)
-        end
-    end
-end)
-
-
-local KnifeAuraEnabled = false
-local KnifeAuraRange = 15
-
-combatSec:Toggle("Knife Aura", false, function(state)
-    KnifeAuraEnabled = state
-    if state then
-        Lib:Notify("Knife Aura", "Active! Range: " .. KnifeAuraRange .. " studs", 3, "success")
-    end
-end)
-
-combatSec:Slider("Knife Aura Range", 15, 1, 5, 50, " studs", function(v)
-    KnifeAuraRange = v
-end)
-
-task.spawn(function()
-    while true do
-        if KnifeAuraEnabled then
-            local char = LocalPlayer.Character
-            local hrp = char and char:FindFirstChild("HumanoidRootPart")
-            if hrp then
-                local knife = char:FindFirstChild("Knife")
-                if not knife then
-                    local bp = LocalPlayer:FindFirstChild("Backpack")
-                    if bp then knife = bp:FindFirstChild("Knife") end
-                end
-                if knife then
-                    knife.Parent = char
-                    for _, p in ipairs(game:GetService("Players"):GetPlayers()) do
-                        if p ~= LocalPlayer and p.Character then
-                            local tHrp = p.Character:FindFirstChild("HumanoidRootPart")
-                            local tHum = p.Character:FindFirstChild("Humanoid")
-                            if tHrp and tHum and tHum.Health > 0 then
-                                local dist = (hrp.Position - tHrp.Position).Magnitude
-                                if dist <= KnifeAuraRange then
-                                    pcall(function() mouse1click() end)
-                                    pcall(function() knife:Activate() end)
-                                end
-                            end
+            if child.Name == "Normal" then
+                for _, mapChild in ipairs(child:GetChildren()) do
+                    if not collectTrap(mapChild, found) then
+                        for _, sub in ipairs(mapChild:GetChildren()) do
+                            collectTrap(sub, found)
                         end
                     end
                 end
             end
         end
-        task.wait(0.1)
-    end
-end)
 
---================================================================--
---     VISUALS: HIT TRACERS / KILL EFFECTS / HIT SOUNDS (state)   --
---================================================================--
+        trapParts = found
+    end)
 
-local HitTracerEnabled = false
-local HitTracerColor = Color3.fromRGB(0, 255, 100)
-local HitTracerRainbow = false
-local HitTracerDuration = 3
-local lastHitTracerShot = 0
-local HitTracerSheriffOnly = false
-local HitTracerBoxThickness = 1
-local HitTracerGlowEnabled = false
-local HitTracerLineEnabled = false
-local HitTracerLineColor = Color3.fromRGB(255, 255, 255)
-local HitTracerLineThickness = 2
+    local function trapDrawingsFor(part)
+        local drawings = trapDrawings[part]
+        if drawings then
+            return drawings
+        end
 
+        drawings = {
+            box = Util.newDrawing("Square", { Color = trapColor, Size = TRAP_BOX_SIZE }),
+            label = Util.newDrawing("Text", {
+                Color = trapColor,
+                Font = Util.drawingFont("UI"),
+                Size = 15,
+                Text = "TRAP",
+                Center = true,
+                Outline = true,
+            }),
+            distance = Util.newDrawing("Text", {
+                Color = trapColor,
+                Font = Util.drawingFont("UI"),
+                Size = 13,
+                Center = true,
+                Outline = true,
+            }),
+        }
 
-local KillEffectEnabled = false
-local KillEffectSheriffOnly = false
-local KillEffectStyle = "Random"
-local KillEffectDurationMultiplier = 3
-local KillEffectVersion = "New (V2)"
-
-local HitSoundsEnabled = false
-local HitSoundsOnlyCustom = false
-local CustomHitSounds = {"(None)"}
-local customSoundsCombo = nil
-local HitSoundIndex = 1
-
-local activeKE = {}
-local kePools = {
-    Circle = {}, Line = {}, Triangle = {}, Square = {}
-}
-
-for i = 1, 40 do local c = Drawing.new("Circle"); c.Visible = false; c.Filled = false; table.insert(kePools.Circle, c) end
-for i = 1, 250 do local l = Drawing.new("Line"); l.Visible = false; table.insert(kePools.Line, l) end
-for i = 1, 150 do local t = Drawing.new("Triangle"); t.Visible = false; t.Filled = true; table.insert(kePools.Triangle, t) end
-for i = 1, 100 do local s = Drawing.new("Square"); s.Visible = false; s.Filled = true; table.insert(kePools.Square, s) end
-
-local function spawnKE(shape, props)
-    local maxAllowed = (shape == "Circle" and 40) or (shape == "Square" and 100) or (shape == "Triangle" and 150) or 250
-    local count = 0
-    for _, e in ipairs(activeKE) do if e.shape == shape then count = count + 1 end end
-    if count >= maxAllowed then return end
-    props.shape = shape
-    props.life = 0
-    if shape ~= "Circle" then
-        props.maxLife = (props.maxLife or 1) * KillEffectDurationMultiplier
-    else
-        props.maxLife = (props.maxLife or 1)
-    end
-    table.insert(activeKE, props)
-end
-
---================================================================--
---                 KILL EFFECT STYLES (V1 & V2)                   --
---================================================================--
-
-local kEffectIndex = 0
-local function triggerKillEffect(hitPos, style)
-    if style == "Random" then
-        local allStyles = {"Laser Eyes", "Cosmic Nova", "Blood Splatter", "Holy Smite", "Toxic Splash", "Ice Shatter", "Void Collapse", "Cyber Glitch", "Sparkler", "Sakura Petals"}
-        kEffectIndex = kEffectIndex + math.random(1, 5)
-        style = allStyles[(kEffectIndex % #allStyles) + 1]
+        trapDrawings[part] = drawings
+        return drawings
     end
 
-    if KillEffectVersion == "Old (V1)" then
-        if style == "Laser Eyes" then
-            spawnKE("Circle", {pos=hitPos, r=10, maxR=250, maxLife=0.6, color=Color3.fromRGB(255, 0, 0), t=5, shrink=true})
-            for i=1, 40 do
-                spawnKE("Line", {pos=hitPos, vel=Vector3.new(math.random(-150,150), math.random(-50,150), math.random(-150,150)), length=math.random(20,50), maxLife=math.random(50,80)/100, color=Color3.fromRGB(255, 0, 0), t=3})
-            end
-        elseif style == "Cosmic Nova" then
-            spawnKE("Circle", {pos=hitPos, r=0, maxR=300, maxLife=0.8, color=Color3.fromRGB(150, 0, 255), t=8})
-            for i=1, 60 do
-                spawnKE("Line", {pos=hitPos, vel=Vector3.new(math.random(-100,100), math.random(-100,100), math.random(-100,100)), length=math.random(20,50), maxLife=math.random(60,100)/100, color=Color3.fromRGB(0, 255, 255), t=3})
-            end
-        elseif style == "Blood Splatter" then
-            for i=1, 10 do spawnKE("Circle", {pos=hitPos+Vector3.new(math.random(-10,10),math.random(-10,10),math.random(-10,10)), r=0, maxR=math.random(30,80), maxLife=math.random(40,70)/100, color=Color3.fromRGB(180, 0, 0), t=5}) end
-            for i=1, 50 do spawnKE("Triangle", {pos=hitPos, vel=Vector3.new(math.random(-50,50), math.random(20,60), math.random(-50,50)), grav=Vector3.new(0,-150,0), rot=CFrame.Angles(0,0,0), rotV=CFrame.Angles(math.random()*2,0,0), size=2, maxLife=0.8, color=Color3.fromRGB(150,0,0)}) end
-        elseif style == "Holy Smite" then
-            spawnKE("Circle", {pos=hitPos, r=0, maxR=250, maxLife=0.5, color=Color3.fromRGB(255, 255, 255), t=10})
-            for i=1, 40 do spawnKE("Line", {pos=hitPos + Vector3.new(math.random(-30,30), 200, math.random(-30,30)), vel=Vector3.new(0,-800,0), length=100, maxLife=0.4, color=Color3.fromRGB(255,215,0), t=4}) end
-        elseif style == "Toxic Splash" then
-            for i=1, 15 do spawnKE("Circle", {pos=hitPos, r=0, maxR=math.random(20,60), maxLife=0.6, color=Color3.fromRGB(50, 255, 50), t=4}) end
-            for i=1, 40 do spawnKE("Square", {pos=hitPos, vel=Vector3.new(math.random(-40,40), math.random(30,80), math.random(-40,40)), grav=Vector3.new(0,-60,0), size=15, maxLife=0.8, color=Color3.fromRGB(50,255,50)}) end
-        elseif style == "Ice Shatter" then
-            spawnKE("Circle", {pos=hitPos, r=0, maxR=180, maxLife=0.5, color=Color3.fromRGB(150, 255, 255), t=5})
-            for i=1, 50 do spawnKE("Triangle", {pos=hitPos, vel=Vector3.new(math.random(-150,150), math.random(-30,80), math.random(-150,150)), grav=Vector3.new(0,-50,0), rot=CFrame.Angles(0,0,0), rotV=CFrame.Angles(0,0,0), size=2, maxLife=0.7, color=Color3.fromRGB(255,255,255)}) end
-        elseif style == "Void Collapse" then
-            spawnKE("Circle", {pos=hitPos, r=300, maxR=0, maxLife=1.0, color=Color3.fromRGB(50, 0, 100), t=15, shrink=true})
-            for i=1, 50 do spawnKE("Line", {pos=hitPos + Vector3.new(math.random(-100,100), math.random(-100,100), math.random(-100,100)), vel=Vector3.new(0,0,0), pullTarget=hitPos, pullSpeed=150, length=20, maxLife=1.0, color=Color3.fromRGB(150,50,255), t=3}) end
-        elseif style == "Cyber Glitch" then
-            for i=1, 40 do spawnKE("Square", {pos=hitPos + Vector3.new(math.random(-40,40), math.random(-40,40), math.random(-40,40)), size=20, maxLife=0.6, color=(math.random()>0.5 and Color3.fromRGB(255,0,255) or Color3.fromRGB(0,255,255))}) end
-            for i=1, 40 do spawnKE("Line", {pos=hitPos, vel=Vector3.new(math.random(-100,100), math.random(-100,100), math.random(-100,100)), length=30, maxLife=0.5, color=Color3.fromRGB(0,255,255), t=4}) end
-        elseif style == "Sparkler" then
-            spawnKE("Circle", {pos=hitPos, r=0, maxR=150, maxLife=0.4, color=Color3.fromRGB(255, 255, 100), t=5})
-            for i=1, 60 do spawnKE("Line", {pos=hitPos, vel=Vector3.new(math.random(-120,120), math.random(40,150), math.random(-120,120)), grav=Vector3.new(0,-100,0), length=15, maxLife=0.8, color=Color3.fromRGB(255,200,50), t=2}) end
-        elseif style == "Sakura Petals" then
-            for i=1, 50 do spawnKE("Triangle", {pos=hitPos + Vector3.new(math.random(-20,20), math.random(10,40), math.random(-20,20)), vel=Vector3.new(math.random(-30,30), math.random(-5,15), math.random(-30,30)), grav=Vector3.new(0,-5,0), sway=2, rot=CFrame.Angles(0,0,0), rotV=CFrame.Angles(0,0,0), size=2, maxLife=2.0, color=Color3.fromRGB(255,160,200)}) end
+    Scheduler.onRender("esp.trapDraw", function()
+        if not state.trap then
+            return
         end
-        return
-    end
 
-    if style == "Laser Eyes" then
-        spawnKE("Circle", {pos=hitPos, r=10, maxR=350, maxLife=0.8, color=Color3.fromRGB(math.random(220,255), 0, 0), color2=Color3.fromRGB(255, math.random(100,160), 0), t=10, shrink=true})
-        spawnKE("Circle", {pos=hitPos, r=0, maxR=180, maxLife=0.6, color=Color3.fromRGB(255, math.random(80,120), 0), color2=Color3.fromRGB(255, 255, math.random(0,100)), t=6})
-        for i=1, 150 do
-            spawnKE("Line", {
-                pos=hitPos, vel=Vector3.new(math.random(-250,250), math.random(-50,300), math.random(-250,250)),
-                length=math.random(30,80), maxLife=math.random(50,110)/100,
-                color=Color3.fromRGB(math.random(200,255), math.random(0,40), 0), color2=Color3.fromRGB(255, math.random(150,220), 0), color3=Color3.fromRGB(255, 255, math.random(150,255)), t=math.random(3,6)
-            })
+        local alive = {}
+        for _, part in ipairs(trapParts) do
+            if part and part.Parent then
+                alive[part] = true
+            end
         end
-        for i=1, 80 do
-            spawnKE("Triangle", {
-                pos=hitPos, vel=Vector3.new(math.random(-100,100), math.random(50,150), math.random(-100,100)),
-                grav=Vector3.new(0,-120,0), rot=CFrame.Angles(math.random()*6,math.random()*6,math.random()*6),
-                rotV=CFrame.Angles(math.random(-20,20)/100,math.random(-20,20)/100,math.random(-20,20)/100),
-                size=math.random(15,35)/10, maxLife=math.random(70,120)/100, color=Color3.fromRGB(255, math.random(20,80), 0), color2=Color3.fromRGB(255, math.random(180,220), math.random(20,80))
-            })
-        end
-    elseif style == "Cosmic Nova" then
-        spawnKE("Circle", {pos=hitPos, r=0, maxR=400, maxLife=1.2, color=Color3.fromRGB(math.random(120,180), 0, 255), color2=Color3.fromRGB(0, math.random(200,255), 255), t=12})
-        spawnKE("Circle", {pos=hitPos, r=0, maxR=250, maxLife=0.9, color=Color3.fromRGB(0, math.random(200,255), 255), color2=Color3.fromRGB(255, 255, 255), t=8})
-        spawnKE("Circle", {pos=hitPos, r=500, maxR=0, maxLife=1.1, color=Color3.fromRGB(math.random(180,220), math.random(80,120), 255), color2=Color3.fromRGB(math.random(30,80), 0, math.random(120,180)), t=5, shrink=true})
-        for i=1, 200 do
-            spawnKE("Line", {
-                pos=hitPos, vel=Vector3.new(math.random(-200,200), math.random(-200,200), math.random(-200,200)),
-                length=math.random(25,75), maxLife=math.random(70,160)/100,
-                color=Color3.fromRGB(math.random(80,150),0,255), color2=Color3.fromRGB(0,math.random(200,255),255), color3=Color3.fromRGB(math.random(200,255),255,255), t=3
-            })
-        end
-        for i=1, 80 do
-            spawnKE("Square", {
-                pos=hitPos + Vector3.new(math.random(-100,100), math.random(-100,100), math.random(-100,100)),
-                pullTarget=hitPos, pullSpeed=150,
-                size=math.random(20,40), maxLife=1.2, color=Color3.fromRGB(math.random(200,255),0,255), color2=Color3.fromRGB(0,math.random(200,255),255)
-            })
-        end
-    elseif style == "Blood Splatter" then
-        for i=1, 25 do
-            spawnKE("Circle", {pos=hitPos + Vector3.new(math.random(-15,15),math.random(-15,15),math.random(-15,15)), r=0, maxR=math.random(40,120), maxLife=math.random(50,90)/100, color=Color3.fromRGB(math.random(120,180), 0, 0), color2=Color3.fromRGB(math.random(200,255), 0, 0), t=math.random(6,12)})
-        end
-        for i=1, 150 do
-            spawnKE("Line", {
-                pos=hitPos, vel=Vector3.new(math.random(-100,100), math.random(-30,120), math.random(-100,100)),
-                grav=Vector3.new(0,-200,0), length=math.random(15,45), maxLife=math.random(80,180)/100,
-                color=Color3.fromRGB(math.random(180,255), 0, 0), color2=Color3.fromRGB(math.random(50,100), 0, 0), t=math.random(4,8)
-            })
-        end
-        for i=1, 100 do
-            spawnKE("Triangle", {
-                pos=hitPos, vel=Vector3.new(math.random(-60,60), math.random(20,80), math.random(-60,60)),
-                grav=Vector3.new(0,-250,0), rot=CFrame.Angles(math.random()*6,math.random()*6,math.random()*6), rotV=CFrame.Angles(math.random()*3,0,0),
-                size=math.random(15,30)/10, maxLife=math.random(80,150)/100, color=Color3.fromRGB(math.random(130,180),0,0), color2=Color3.fromRGB(math.random(30,70),0,0)
-            })
-        end
-    elseif style == "Holy Smite" then
-        -- Devastating celestial explosion!
-        spawnKE("Circle", {pos=hitPos, r=0, maxR=600, maxLife=1.2, color=Color3.fromRGB(255, 255, 255), color2=Color3.fromRGB(255, 215, 0), t=30, shrink=true})
-        spawnKE("Circle", {pos=hitPos, r=200, maxR=0, maxLife=0.8, color=Color3.fromRGB(255, 255, 150), t=15})
-        -- Ground impact shockwave (fast horizontal lines)
-        for i=1, 100 do
-            spawnKE("Line", {
-                pos=hitPos, vel=Vector3.new(math.random(-600,600), 0, math.random(-600,600)),
-                length=math.random(40,120), maxLife=0.6, color=Color3.fromRGB(255,255,255), color2=Color3.fromRGB(255,215,0), t=6
-            })
-        end
-        -- Celestial ascension (Gold squares flying UP)
-        for i=1, 80 do
-            spawnKE("Square", {
-                pos=hitPos + Vector3.new(math.random(-100,100), math.random(0,50), math.random(-100,100)),
-                vel=Vector3.new(0, math.random(200,500), 0), size=math.random(20,50), maxLife=1.2,
-                color=Color3.fromRGB(255, math.random(200,255), 0), color2=Color3.fromRGB(255,255,255), flicker=true
-            })
-        end
-        -- Divine spear strikes from heaven
-        for i=1, 60 do
-            spawnKE("Line", {
-                pos=hitPos + Vector3.new(math.random(-150,150), math.random(300,800), math.random(-150,150)),
-                vel=Vector3.new(0, -1500, 0), length=math.random(150,300), maxLife=0.5,
-                color=Color3.fromRGB(255,255,255), color2=Color3.fromRGB(255,math.random(150,215),0), t=12
-            })
-        end
-    elseif style == "Toxic Splash" then
-        for i=1, 35 do
-            spawnKE("Circle", {pos=hitPos + Vector3.new(math.random(-25,25),math.random(-15,30),math.random(-25,25)), r=0, maxR=math.random(30,90), maxLife=math.random(50,140)/100, color=Color3.fromRGB(math.random(30,80), 255, math.random(30,80)), color2=Color3.fromRGB(0, math.random(100,180), 0), t=math.random(4,10)})
-        end
-        for i=1, 120 do
-            spawnKE("Triangle", {
-                pos=hitPos, vel=Vector3.new(math.random(-60,60), math.random(30,100), math.random(-60,60)),
-                grav=Vector3.new(0,-60,0), rot=CFrame.Angles(0,0,0), rotV=CFrame.Angles(math.random()*0.2,math.random()*0.2,0),
-                size=math.random(15,30)/10, maxLife=math.random(80,180)/100, color=Color3.fromRGB(math.random(80,140),255,math.random(30,80)), color2=Color3.fromRGB(math.random(10,30),math.random(80,140),math.random(10,30))
-            })
-        end
-        for i=1, 60 do
-            spawnKE("Square", {
-                pos=hitPos, vel=Vector3.new(math.random(-40,40), math.random(50,120), math.random(-40,40)),
-                grav=Vector3.new(0,-80,0), size=math.random(15,25), maxLife=math.random(60,140)/100, color=Color3.fromRGB(math.random(30,80),255,math.random(30,80))
-            })
-        end
-    elseif style == "Ice Shatter" then
-        for i=1, 15 do
-            spawnKE("Circle", {pos=hitPos, r=0, maxR=math.random(150,250), maxLife=0.6, color=Color3.fromRGB(math.random(120,180), 255, 255), color2=Color3.fromRGB(255, 255, 255), t=5})
-        end
-        for i=1, 150 do
-            spawnKE("Triangle", {
-                pos=hitPos, vel=Vector3.new(math.random(-200,200), math.random(-50,100), math.random(-200,200)),
-                grav=Vector3.new(0,-80,0), rot=CFrame.Angles(math.random()*6,math.random()*6,math.random()*6), rotV=CFrame.Angles(math.random()*0.4,0,0),
-                size=math.random(15,40)/10, maxLife=math.random(60,120)/100, color=Color3.fromRGB(math.random(150,200),255,255), color2=Color3.fromRGB(255,255,255)
-            })
-        end
-        for i=1, 100 do
-            spawnKE("Line", {
-                pos=hitPos, vel=Vector3.new(math.random(-250,250), math.random(-50,50), math.random(-250,250)),
-                length=math.random(25,70), maxLife=0.6, color=Color3.fromRGB(math.random(180,220),255,255), color2=Color3.fromRGB(255,255,255), t=4
-            })
-        end
-    elseif style == "Void Collapse" then
-        spawnKE("Circle", {pos=hitPos, r=450, maxR=0, maxLife=1.4, color=Color3.fromRGB(0, 0, 0), color2=Color3.fromRGB(math.random(30,80), 0, math.random(80,150)), t=25, shrink=true})
-        spawnKE("Circle", {pos=hitPos, r=300, maxR=0, maxLife=1.0, color=Color3.fromRGB(math.random(20,60), 0, math.random(60,100)), color2=Color3.fromRGB(math.random(80,120), 0, math.random(180,220)), t=15, shrink=true})
-        for i=1, 150 do
-            spawnKE("Line", {
-                pos=hitPos + Vector3.new(math.random(-150,150), math.random(-150,150), math.random(-150,150)), 
-                vel=Vector3.new(0,0,0), pullTarget=hitPos, pullSpeed=math.random(150, 300), length=math.random(25,50), maxLife=1.4, color=Color3.fromRGB(math.random(100,180),math.random(20,80),255), color2=Color3.fromRGB(0,0,0), t=5
-            })
-        end
-        for i=1, 100 do
-            spawnKE("Triangle", {
-                pos=hitPos + Vector3.new(math.random(-100,100), math.random(-100,100), math.random(-100,100)),
-                pullTarget=hitPos, pullSpeed=200, rot=CFrame.Angles(math.random()*6,math.random()*6,math.random()*6), rotV=CFrame.Angles(0.2,0.2,0.2),
-                size=math.random(20,35)/10, maxLife=1.4, color=Color3.fromRGB(math.random(60,100),0,math.random(100,150)), color2=Color3.fromRGB(math.random(200,255),0,255)
-            })
-        end
-    elseif style == "Cyber Glitch" then
-        for i=1, 100 do
-            spawnKE("Square", {
-                pos=hitPos + Vector3.new(math.random(-60,60), math.random(-60,60), math.random(-60,60)),
-                size=math.random(25,60), maxLife=math.random(40,100)/100, color=(math.random()>0.5 and Color3.fromRGB(255,math.random(0,50),255) or Color3.fromRGB(math.random(0,50),255,255)), color2=Color3.fromRGB(255,255,255), flicker=true
-            })
-        end
-        for i=1, 150 do
-            spawnKE("Line", {
-                pos=hitPos + Vector3.new(math.random(-50,50), math.random(-50,50), math.random(-50,50)), 
-                vel=Vector3.new(math.random(-150,150), math.random(-150,150), math.random(-150,150)), length=math.random(30,100), maxLife=math.random(40,90)/100, color=Color3.fromRGB(math.random(0,50),255,255), color2=Color3.fromRGB(255,math.random(0,50),255), t=7, flicker=true
-            })
-        end
-    elseif style == "Sparkler" then
-        spawnKE("Circle", {pos=hitPos, r=0, maxR=200, maxLife=0.5, color=Color3.fromRGB(255, 255, math.random(100,200)), color2=Color3.fromRGB(255, 255, 255), t=8})
-        for i=1, 200 do
-            spawnKE("Line", {
-                pos=hitPos, vel=Vector3.new(math.random(-180,180), math.random(50,200), math.random(-180,180)),
-                grav=Vector3.new(0,-150,0), length=math.random(10,25), maxLife=math.random(70,150)/100, color=Color3.fromRGB(255,255,math.random(100,255)), color2=Color3.fromRGB(255,math.random(50,150),0), t=4
-            })
-        end
-        for i=1, 80 do
-            spawnKE("Triangle", {
-                pos=hitPos, vel=Vector3.new(math.random(-120,120), math.random(80,250), math.random(-120,120)),
-                grav=Vector3.new(0,-180,0), rot=CFrame.Angles(math.random()*6,math.random()*6,math.random()*6), rotV=CFrame.Angles(math.random()*0.5,math.random()*0.5,0),
-                size=math.random(10,20)/10, maxLife=math.random(70,140)/100, color=Color3.fromRGB(255,math.random(180,220),math.random(50,100)), color2=Color3.fromRGB(255,255,255)
-            })
-        end
-    elseif style == "Sakura Petals" then
-        for i=1, 150 do
-            spawnKE("Triangle", {
-                pos=hitPos + Vector3.new(math.random(-30,30), math.random(10,60), math.random(-30,30)),
-                vel=Vector3.new(math.random(-50,50), math.random(-5,25), math.random(-50,50)),
-                grav=Vector3.new(0,-10,0), sway=math.random(20,50)/10, rot=CFrame.Angles(math.random()*6,math.random()*6,math.random()*6), rotV=CFrame.Angles(0.02,0.05,0.02),
-                size=math.random(15,30)/10, maxLife=math.random(250,500)/100, color=Color3.fromRGB(255,math.random(140,180),math.random(180,230)), color2=Color3.fromRGB(255,math.random(200,230),255)
-            })
-        end
-    end
-end
 
-local function lerpColor(c1, c2, alpha)
-    local r = c1.R + (c2.R - c1.R) * alpha
-    local g = c1.G + (c2.G - c1.G) * alpha
-    local b = c1.B + (c2.B - c1.B) * alpha
-    return Color3.new(r, g, b)
-end
-
-RunService.RenderStepped:Connect(function(dt)
-    if not KillEffectEnabled and #activeKE == 0 then return end
-    
-    local cam = game:GetService("Workspace").CurrentCamera
-    local function WTS(p)
-        if type(WorldToScreen) == "function" then
-            local w, on = WorldToScreen(p)
-            if on then return w, on end
+        for part, drawings in pairs(trapDrawings) do
+            if not alive[part] then
+                drawings.box:Remove()
+                drawings.label:Remove()
+                drawings.distance:Remove()
+                trapDrawings[part] = nil
+            end
         end
-        local ok, vp, on = pcall(function() return cam:WorldToViewportPoint(p) end)
-        if ok and on then return Vector2.new(vp.X, vp.Y), on end
-        return Vector2.new(0,0), false
-    end
-    
-    local cIdx, lIdx, tIdx, sIdx = 1, 1, 1, 1
-    
-    for i = #activeKE, 1, -1 do
-        local e = activeKE[i]
-        e.life = e.life + dt
-        if e.life >= e.maxLife then
-            table.remove(activeKE, i)
-        else
-            local prog = e.life / e.maxLife
-            
-            if e.vel then 
-                e.pos = e.pos + e.vel * dt 
-                e.vel = e.vel * (1 - math.min(1, dt * 3))
-            end
-            if e.grav then 
-                e.vel = e.vel + e.grav * dt 
-                e.grav = e.grav * (1 - math.min(1, dt * 2))
-            end
-            if e.pullTarget then
-                local dir = (e.pullTarget - e.pos)
-                if dir.Magnitude > 1 then
-                    e.pos = e.pos + dir.Unit * e.pullSpeed * dt
-                end
-            end
-            if e.sway then
-                e.pos = e.pos + Vector3.new(math.sin(e.life * e.sway) * 5 * dt, 0, math.cos(e.life * e.sway * 0.7) * 5 * dt)
-            end
-            if e.rot then e.rot = e.rot * e.rotV end
-            
-            local sPos, onScreen = WTS(e.pos)
-            
+
+        local root = Util.getHRP()
+
+        for part in pairs(alive) do
+            local drawings = trapDrawingsFor(part)
+            local position, onScreen = worldToScreen(part.Position)
+
             if onScreen then
-                local renderColor = e.color
-                if e.color2 then
-                    if prog < 0.5 then
-                        renderColor = lerpColor(e.color, e.color2, prog * 2)
-                    else
-                        renderColor = lerpColor(e.color2, e.color3 or e.color2, (prog - 0.5) * 2)
-                    end
-                end
-                
-                if e.flicker then
-                    renderColor = (math.random() > 0.5) and renderColor or Color3.new(1,1,1)
-                end
+                drawings.box.Position = position - (TRAP_BOX_SIZE / 2)
+                drawings.box.Visible = true
 
-                if e.shape == "Circle" and cIdx <= 40 then
-                    local c = kePools.Circle[cIdx]
-                    if e.shrink then
-                        c.Radius = e.r - ((e.r - e.maxR) * prog)
-                    else
-                        c.Radius = e.r + ((e.maxR - e.r) * math.pow(prog, 0.5))
-                    end
-                    c.Position = sPos
-                    c.Color = renderColor
-                    c.Transparency = 1 - prog
-                    c.Thickness = math.max(1, (e.t or 5) * (1 - prog))
-                    c.Visible = true
-                    cIdx = cIdx + 1
-                elseif e.shape == "Line" and lIdx <= 250 then
-                    local l = kePools.Line[lIdx]
-                    local tail = e.pos - (e.vel and e.vel.Unit * e.length or Vector3.new(0,e.length,0))
-                    local sTail, tOn = WTS(tail)
-                    if tOn then
-                        l.From = sTail
-                        l.To = sPos
-                        l.Color = renderColor
-                        l.Transparency = 1 - prog
-                        l.Thickness = e.t or 2
-                        l.Visible = true
-                        lIdx = lIdx + 1
-                    end
-                elseif e.shape == "StaticLine" and lIdx <= 250 then
-                    local l = kePools.Line[lIdx]
-                    local s2, on2 = WTS(e.pos2)
-                    if onScreen and on2 then
-                        l.From = sPos
-                        l.To = s2
-                        l.Color = renderColor
-                        l.Transparency = 1 - prog
-                        l.Thickness = e.t or 3
-                        l.Visible = true
-                        lIdx = lIdx + 1
-                    end
-                elseif e.shape == "Triangle" and tIdx <= 150 then
-                    local size = e.size * (1 - prog)
-                    local p1 = e.pos + (e.rot * Vector3.new(0, size, 0))
-                    local p2 = e.pos + (e.rot * Vector3.new(-size, -size, 0))
-                    local p3 = e.pos + (e.rot * Vector3.new(size, -size, 0))
-                    local s1, on1 = WTS(p1)
-                    local s2, on2 = WTS(p2)
-                    local s3, on3 = WTS(p3)
-                    if on1 and on2 and on3 then
-                        local t = kePools.Triangle[tIdx]
-                        t.PointA = s1; t.PointB = s2; t.PointC = s3
-                        t.Color = renderColor
-                        t.Transparency = 1 - prog
-                        t.Visible = true
-                        tIdx = tIdx + 1
-                    end
-                elseif e.shape == "Square" and sIdx <= 100 then
-                    local sq = kePools.Square[sIdx]
-                    if e.flicker then
-                        sq.Position = sPos + Vector2.new(math.random(-10,10), math.random(-10,10))
-                        sq.Transparency = (math.random()>0.5) and 1 or 0
-                    else
-                        sq.Position = sPos - Vector2.new(e.size/2, e.size/2)
-                        sq.Transparency = 1 - prog
-                    end
-                    sq.Size = Vector2.new(e.size, e.size)
-                    sq.Color = renderColor
-                    sq.Visible = true
-                    sIdx = sIdx + 1
-                end
-            end
-        end
-    end
-    
-    for i = cIdx, 40 do kePools.Circle[i].Visible = false end
-    for i = lIdx, 250 do kePools.Line[i].Visible = false end
-    for i = tIdx, 150 do kePools.Triangle[i].Visible = false end
-    for i = sIdx, 100 do kePools.Square[i].Visible = false end
-end)
+                drawings.label.Position = position - Vector2.new(0, 18)
+                drawings.label.Visible = true
 
---================================================================--
---                  HIT TRACER RENDERING                          --
---================================================================--
-
-local function CustomW2S(p)
-    if type(WorldToScreen) == "function" then
-        local ok, pos2d, onScreen = pcall(WorldToScreen, p)
-        if ok and pos2d then return pos2d, onScreen end
-    end
-    local cam = workspace.CurrentCamera
-    if cam then
-        local ok, vp, on = pcall(function() return cam:WorldToViewportPoint(p) end)
-        if ok and vp then
-            return Vector2.new(vp.X, vp.Y), on
-        end
-    end
-    return Vector2.new(0,0), false
-end
-
-local function spawnHitTracerCube(cframe, size, duration, color)
-    local s = size / 2
-    local localVerts = {
-        Vector3.new(-s.X, -s.Y, -s.Z), Vector3.new( s.X, -s.Y, -s.Z),
-        Vector3.new( s.X,  s.Y, -s.Z), Vector3.new(-s.X,  s.Y, -s.Z),
-        Vector3.new(-s.X, -s.Y,  s.Z), Vector3.new( s.X, -s.Y,  s.Z),
-        Vector3.new( s.X,  s.Y,  s.Z), Vector3.new(-s.X,  s.Y,  s.Z)
-    }
-    
-    local worldVerts = {}
-    for i = 1, 8 do
-        local ok, wp = pcall(function() return cframe:PointToWorldSpace(localVerts[i]) end)
-        if not ok or not wp then wp = cframe.Position + localVerts[i] end
-        worldVerts[i] = wp
-    end
-    
-    local edges = {
-        {1, 2}, {2, 3}, {3, 4}, {4, 1},
-        {5, 6}, {6, 7}, {7, 8}, {8, 5},
-        {1, 5}, {2, 6}, {3, 7}, {4, 8}
-    }
-    
-    local lines = {}
-    local glowLines = {}
-    for i = 1, #edges do
-        if HitTracerGlowEnabled then
-            glowLines[i] = {}
-            for g = 1, 2 do
-                local gLine = (Drawing and Drawing.new or function() return {Remove = function() end} end)("Line")
-                if type(gLine) == "table" and gLine.Thickness then
-                    gLine.Thickness = HitTracerBoxThickness + (g * 4)
-                    gLine.Color = color
-                    gLine.Visible = false
-                    pcall(function() gLine.ZIndex = 0 end)
-                    table.insert(glowLines[i], gLine)
+                if root then
+                    drawings.distance.Text = string.format("%.1f", (root.Position - part.Position).Magnitude)
+                    drawings.distance.Position = position + Vector2.new(0, 10)
+                    drawings.distance.Visible = true
+                else
+                    drawings.distance.Visible = false
                 end
-            end
-        end
-        
-        local line = (Drawing and Drawing.new or function() return {Remove = function() end} end)("Line")
-        if type(line) == "table" and not line.Thickness then break end
-        line.Thickness = HitTracerBoxThickness
-        line.Color = color
-        line.Visible = false
-        pcall(function() line.ZIndex = 1 end)
-        lines[i] = line
-    end
-    
-    if #lines == 0 then return end
-    
-    local startTime = os.clock()
-    local conn
-    
-    conn = RunService.RenderStepped:Connect(function()
-        local elapsed = os.clock() - startTime
-        
-        if elapsed > duration then
-            for _, line in pairs(lines) do pcall(function() line:Remove() end) end
-            for _, gList in pairs(glowLines) do
-                for _, gLine in ipairs(gList) do pcall(function() gLine:Remove() end) end
-            end
-            if conn then conn:Disconnect() end
-            return
-        end
-        
-        local alpha = 1 - (elapsed / duration)
-        
-        if HitTracerRainbow then
-            local hue = (os.clock() % 2) / 2
-            local rbColor = Color3.fromHSV(hue, 1, 1)
-            for _, line in pairs(lines) do pcall(function() line.Color = rbColor end) end
-            for _, gList in pairs(glowLines) do
-                for _, gLine in ipairs(gList) do pcall(function() gLine.Color = rbColor end) end
-            end
-        end
-
-        for i, edge in ipairs(edges) do
-            local p1 = worldVerts[edge[1]]
-            local p2 = worldVerts[edge[2]]
-            
-            local s1, on1 = CustomW2S(p1)
-            local s2, on2 = CustomW2S(p2)
-            
-            local line = lines[i]
-            if line and on1 and on2 then
-                line.From = Vector2.new(s1.X, s1.Y)
-                line.To = Vector2.new(s2.X, s2.Y)
-                line.Transparency = alpha
-                line.Visible = true
-                
-                if glowLines[i] then
-                    for g, gLine in ipairs(glowLines[i]) do
-                        gLine.From = line.From
-                        gLine.To = line.To
-                        gLine.Transparency = alpha * (0.75 - (g * 0.2))
-                        gLine.Visible = true
-                    end
-                end
-            elseif line then
-                line.Visible = false
-                if glowLines[i] then
-                    for _, gLine in ipairs(glowLines[i]) do gLine.Visible = false end
-                end
+            else
+                drawings.box.Visible = false
+                drawings.label.Visible = false
+                drawings.distance.Visible = false
             end
         end
     end)
-end
+end)
 
-local function spawnHitTracerConnectionLine(startPos, endPos, duration, color, thickness)
-    local line = (Drawing and Drawing.new or function() return {Remove = function() end} end)("Line")
-    if type(line) == "table" and not line.Thickness then return end
-    line.Thickness = thickness
-    line.Color = color
-    line.Visible = false
-    
-    local glowLine
-    if HitTracerGlowEnabled then
-        glowLine = (Drawing and Drawing.new or function() return {Remove = function() end} end)("Line")
-        if type(glowLine) == "table" and glowLine.Thickness then
-            glowLine.Thickness = thickness + 4
-            glowLine.Color = color
-            glowLine.Visible = false
+--================================================================--
+--      MODULE: COMBAT (gun grab, kill all, knife aura)           --
+--================================================================--
+
+defineModule("combat", function(Ctx)
+    local Lib = Ctx.Lib
+    local Players = Services.Players
+    local Workspace = Services.Workspace
+
+    local state = {
+        autoGetGun = false,
+        getGunHotkey = false,
+        killHotkey = false,
+        autoKillLoop = false,
+        knifeAura = false,
+        knifeAuraRange = 15,
+    }
+
+    local combatSection = Ctx.tabs.combat:Section("Combat", "Left")
+
+    ----------------------------------------------------------------
+    -- Auto get gun
+    ----------------------------------------------------------------
+
+    local GUN_GRAB_RANGE = 1000
+    local GUN_GRAB_COOLDOWN = 1.5
+
+    local function grabGun(isAuto)
+        local root = Util.getHRP()
+        if not root then
+            return false
         end
+
+        local gunDrop = Util.findGunDrop()
+        if not gunDrop then
+            if not isAuto then
+                Lib:Notify("Not Found", "No dropped gun found on the map!", 3)
+            end
+            return false
+        end
+
+        if isAuto and (root.Position - gunDrop.Position).Magnitude > GUN_GRAB_RANGE then
+            return false
+        end
+
+        local origin = root.CFrame
+        root.CFrame = gunDrop.CFrame
+        task.wait()
+
+        if root.Parent then
+            root.CFrame = origin
+        end
+
+        return true
     end
-    
-    local startTime = os.clock()
-    local lastUpdate = 0
-    local conn
-    
-    conn = RunService.RenderStepped:Connect(function()
-        local elapsed = os.clock() - startTime
-        if elapsed > duration then
-            pcall(function() line:Remove() end)
-            if glowLine then pcall(function() glowLine:Remove() end) end
-            if conn then conn:Disconnect() end
+
+    combatSection:Toggle("Auto Get Gun", false, function(enabled)
+        state.autoGetGun = enabled
+    end)
+
+    combatSection:Button("Teleport to Dropped Gun", function()
+        grabGun(false)
+    end)
+
+    local getGunToggle = combatSection:Toggle("Get Gun (Hotkey)", false, function(enabled)
+        state.getGunHotkey = enabled
+    end)
+
+    getGunToggle:AddKeybind("g", "Hold", function(active)
+        if active and state.getGunHotkey then
+            task.spawn(grabGun, false)
+        end
+    end)
+
+    local nextGunGrab = 0
+
+    Scheduler.every("combat.autoGetGun", 0.1, function()
+        if not state.autoGetGun or os.clock() < nextGunGrab then
             return
         end
-        
-        local alpha = 1 - (elapsed / duration)
-        
-        if HitTracerRainbow then
-            local hue = (os.clock() % 2) / 2
-            local rbColor = Color3.fromHSV(hue, 1, 1)
-            pcall(function() line.Color = rbColor end)
-            if glowLine then pcall(function() glowLine.Color = rbColor end) end
+
+        if Util.playerHasTool(LocalPlayer, "Gun") or Util.playerHasTool(LocalPlayer, "Knife") then
+            return
         end
 
-        local s1, on1 = CustomW2S(startPos)
-        local s2, on2 = CustomW2S(endPos)
+        -- grabGun yields for a frame, so it runs off the dispatcher.
+        nextGunGrab = os.clock() + GUN_GRAB_COOLDOWN
+        task.spawn(grabGun, true)
+    end)
 
-        if on1 and on2 then
-            line.From = Vector2.new(s1.X, s1.Y)
-            line.To = Vector2.new(s2.X, s2.Y)
-            line.Transparency = alpha
-            line.Visible = true
-            
-            if glowLine then
-                glowLine.From = line.From
-                glowLine.To = line.To
-                glowLine.Transparency = alpha * 0.3
-                glowLine.Visible = true
+    ----------------------------------------------------------------
+    -- Kill all
+    ----------------------------------------------------------------
+
+    local KILL_ALL_RANGE = 500
+    local KILL_ALL_MAX_ATTEMPTS = 50
+    local KNIFE_SLOT_KEY = 0x31 -- "1"
+
+    local autoKillRunning = false
+
+    local function collectKillTargets(root, ignoreRange)
+        local targets = {}
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer and Util.isAlive(player) then
+                local targetRoot = Util.getPlayerHRP(player)
+                if targetRoot and (ignoreRange or (root.Position - targetRoot.Position).Magnitude <= KILL_ALL_RANGE) then
+                    table.insert(targets, player)
+                end
             end
+        end
+        return targets
+    end
+
+    local function killLoop(root, knife, targets)
+        local attempts = 0
+
+        while autoKillRunning and attempts < KILL_ALL_MAX_ATTEMPTS do
+            if not root.Parent then
+                break
+            end
+
+            local camera = Workspace.CurrentCamera
+            local look = camera.CFrame.LookVector
+            look = Vector3.new(look.X, 0, look.Z).Unit
+
+            local bringPosition = root.Position + (look * 3.5)
+            local bringCFrame = CFrame.lookAt(bringPosition, root.Position)
+
+            root.CFrame = CFrame.lookAt(root.Position, Vector3.new(bringPosition.X, root.Position.Y, bringPosition.Z))
+
+            local anyoneAlive = false
+            for _, target in ipairs(targets) do
+                local targetRoot = Util.getPlayerHRP(target)
+                if targetRoot and Util.isAlive(target) then
+                    anyoneAlive = true
+                    pcall(function()
+                        targetRoot.CFrame = bringCFrame
+                        targetRoot.AssemblyLinearVelocity = Vector3.zero
+                        targetRoot.AssemblyAngularVelocity = Vector3.zero
+                    end)
+                end
+            end
+
+            if not anyoneAlive then
+                break
+            end
+
+            Util.clickMouse()
+            knife:Activate()
+
+            task.wait(0.05)
+            attempts = attempts + 1
+        end
+    end
+
+    local function runAutoKill(ignoreRange)
+        if autoKillRunning then
+            return
+        end
+
+        local character = LocalPlayer.Character
+        local root = Util.getHRP()
+        if not (character and root) then
+            return
+        end
+
+        local knife = character:FindFirstChild("Knife")
+            or (LocalPlayer:FindFirstChildOfClass("Backpack") and LocalPlayer:FindFirstChildOfClass("Backpack"):FindFirstChild("Knife"))
+
+        if not knife then
+            Lib:Notify("Auto Kill", "You must be the Murderer (Knife not found)!", 3, "error")
+            return
+        end
+
+        if knife.Parent ~= character then
+            if character:FindFirstChildOfClass("Humanoid") then
+                Util.tapKey(KNIFE_SLOT_KEY)
+            else
+                knife.Parent = character
+            end
+        end
+
+        task.wait(0.7)
+
+        local targets = collectKillTargets(root, ignoreRange)
+        if #targets == 0 then
+            Lib:Notify("Auto Kill", "No targets found!", 3)
+            return
+        end
+
+        autoKillRunning = true
+        Lib:Notify("Auto Kill", "Starting! Eradicating " .. #targets .. " players.", 3, "warning")
+
+        local ok, err = pcall(killLoop, root, knife, targets)
+        autoKillRunning = false
+
+        if ok then
+            Lib:Notify("Auto Kill", "Eradication Complete!", 3, "success")
         else
-            line.Visible = false
-            if glowLine then glowLine.Visible = false end
+            Lib:Notify("Auto Kill", "Stopped: " .. tostring(err), 4, "error")
+        end
+    end
+
+    Ctx.Combat = { runAutoKill = runAutoKill }
+
+    combatSection:Button("Kill All (Button)", function()
+        task.spawn(runAutoKill)
+    end)
+
+    local killToggle = combatSection:Toggle("Kill All (Hotkey)", false, function(enabled)
+        state.killHotkey = enabled
+    end)
+
+    killToggle:AddKeybind("k", "Hold", function(active)
+        if active and state.killHotkey then
+            task.spawn(runAutoKill)
         end
     end)
-end
 
-local function drawFullHitTracer(character, duration, color)
-    local ok, children = pcall(function() return character:GetChildren() end)
-    if not ok or type(children) ~= "table" then return end
-    
-    for _, part in ipairs(children) do
-        if typeof(part) == "Instance" and part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" then
-            local okTrans, trans = pcall(function() return part.Transparency end)
-            if not okTrans or type(trans) ~= "number" or trans < 1 then
-                local okCF, cf = pcall(function() return part.CFrame end)
-                local okSz, sz = pcall(function() return part.Size end)
-                if okCF and okSz and typeof(cf) == "CFrame" and typeof(sz) == "Vector3" then
-                    spawnHitTracerCube(cf, sz, duration, color)
+    combatSection:Toggle("Auto Kill All (Loop)", false, function(enabled)
+        state.autoKillLoop = enabled
+        if enabled then
+            Lib:Notify("Auto Kill", "Auto Kill All loop started!", 3, "success")
+        end
+    end)
+
+    Scheduler.every("combat.autoKillLoop", 1, function()
+        if state.autoKillLoop and not autoKillRunning then
+            task.spawn(runAutoKill)
+        end
+    end)
+
+    ----------------------------------------------------------------
+    -- Knife aura
+    ----------------------------------------------------------------
+
+    combatSection:Toggle("Knife Aura", false, function(enabled)
+        state.knifeAura = enabled
+        if enabled then
+            Lib:Notify("Knife Aura", "Active! Range: " .. state.knifeAuraRange .. " studs", 3, "success")
+        end
+    end)
+
+    combatSection:Slider("Knife Aura Range", 15, 1, 5, 50, " studs", function(value)
+        state.knifeAuraRange = value
+    end)
+
+    Scheduler.every("combat.knifeAura", 0.1, function()
+        if not state.knifeAura then
+            return
+        end
+
+        local character = LocalPlayer.Character
+        local root = Util.getHRP()
+        if not (character and root) then
+            return
+        end
+
+        local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+        local knife = character:FindFirstChild("Knife") or (backpack and backpack:FindFirstChild("Knife"))
+        if not knife then
+            return
+        end
+
+        knife.Parent = character
+
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer and Util.isAlive(player) then
+                local targetRoot = Util.getPlayerHRP(player)
+                if targetRoot and (root.Position - targetRoot.Position).Magnitude <= state.knifeAuraRange then
+                    Util.clickMouse()
+                    knife:Activate()
                 end
             end
         end
+    end)
+end)
+
+--================================================================--
+--        MODULE: VFX (kill effects, hit tracers, hit sounds)     --
+--================================================================--
+
+
+defineModule("vfx", function(Ctx)
+    local Players = Services.Players
+    local worldToScreen = Util.worldToScreen
+    local lerpColor = Util.lerpColor
+    local random = math.random
+
+    local visualsTab = Ctx.tabs.visuals
+
+    ----------------------------------------------------------------
+    -- Palette
+    ----------------------------------------------------------------
+
+    local Palette = {
+        WHITE = Color3.fromRGB(255, 255, 255),
+        BLACK = Color3.fromRGB(0, 0, 0),
+        GOLD = Color3.fromRGB(255, 215, 0),
+        HOLY_WARM = Color3.fromRGB(255, 255, 150),
+        RED = Color3.fromRGB(255, 0, 0),
+        BLOOD = Color3.fromRGB(180, 0, 0),
+        BLOOD_DARK = Color3.fromRGB(150, 0, 0),
+        CYAN = Color3.fromRGB(0, 255, 255),
+        MAGENTA = Color3.fromRGB(255, 0, 255),
+        VIOLET = Color3.fromRGB(150, 0, 255),
+        VOID = Color3.fromRGB(50, 0, 100),
+        VOID_LIGHT = Color3.fromRGB(150, 50, 255),
+        TOXIC = Color3.fromRGB(50, 255, 50),
+        ICE = Color3.fromRGB(150, 255, 255),
+        SPARK = Color3.fromRGB(255, 255, 100),
+        SPARK_WARM = Color3.fromRGB(255, 200, 50),
+        SAKURA = Color3.fromRGB(255, 160, 200),
+    }
+
+    local Shade = {
+        laser = function() return Color3.fromRGB(random(220, 255), 0, 0) end,
+        laserSpark = function() return Color3.fromRGB(random(200, 255), random(0, 40), 0) end,
+        ember = function() return Color3.fromRGB(255, random(100, 160), 0) end,
+        emberBright = function() return Color3.fromRGB(255, random(150, 220), 0) end,
+        emberPale = function() return Color3.fromRGB(255, 255, random(150, 255)) end,
+        flame = function() return Color3.fromRGB(255, random(20, 80), 0) end,
+        flameAsh = function() return Color3.fromRGB(255, random(180, 220), random(20, 80)) end,
+
+        nova = function() return Color3.fromRGB(random(120, 180), 0, 255) end,
+        novaDeep = function() return Color3.fromRGB(random(80, 150), 0, 255) end,
+        novaBright = function() return Color3.fromRGB(random(200, 255), 0, 255) end,
+        starlight = function() return Color3.fromRGB(0, random(200, 255), 255) end,
+        starlightPale = function() return Color3.fromRGB(random(200, 255), 255, 255) end,
+        nebula = function() return Color3.fromRGB(random(180, 220), random(80, 120), 255) end,
+        nebulaDark = function() return Color3.fromRGB(random(30, 80), 0, random(120, 180)) end,
+
+        blood = function() return Color3.fromRGB(random(120, 180), 0, 0) end,
+        bloodBright = function() return Color3.fromRGB(random(180, 255), 0, 0) end,
+        bloodDeep = function() return Color3.fromRGB(random(50, 100), 0, 0) end,
+        bloodClot = function() return Color3.fromRGB(random(130, 180), 0, 0) end,
+        bloodDry = function() return Color3.fromRGB(random(30, 70), 0, 0) end,
+
+        holyGold = function() return Color3.fromRGB(255, random(200, 255), 0) end,
+        holySpear = function() return Color3.fromRGB(255, random(150, 215), 0) end,
+
+        toxic = function() return Color3.fromRGB(random(30, 80), 255, random(30, 80)) end,
+        toxicDeep = function() return Color3.fromRGB(0, random(100, 180), 0) end,
+        toxicLeaf = function() return Color3.fromRGB(random(80, 140), 255, random(30, 80)) end,
+        toxicShadow = function() return Color3.fromRGB(random(10, 30), random(80, 140), random(10, 30)) end,
+
+        ice = function() return Color3.fromRGB(random(120, 180), 255, 255) end,
+        iceShard = function() return Color3.fromRGB(random(150, 200), 255, 255) end,
+        iceMist = function() return Color3.fromRGB(random(180, 220), 255, 255) end,
+
+        voidCore = function() return Color3.fromRGB(random(30, 80), 0, random(80, 150)) end,
+        voidInner = function() return Color3.fromRGB(random(20, 60), 0, random(60, 100)) end,
+        voidRim = function() return Color3.fromRGB(random(80, 120), 0, random(180, 220)) end,
+        voidStrand = function() return Color3.fromRGB(random(100, 180), random(20, 80), 255) end,
+        voidDust = function() return Color3.fromRGB(random(60, 100), 0, random(100, 150)) end,
+
+        glitchPink = function() return Color3.fromRGB(255, random(0, 50), 255) end,
+        glitchCyan = function() return Color3.fromRGB(random(0, 50), 255, 255) end,
+
+        sparkCore = function() return Color3.fromRGB(255, 255, random(100, 200)) end,
+        sparkTrail = function() return Color3.fromRGB(255, 255, random(100, 255)) end,
+        sparkFade = function() return Color3.fromRGB(255, random(50, 150), 0) end,
+        sparkShard = function() return Color3.fromRGB(255, random(180, 220), random(50, 100)) end,
+
+        petal = function() return Color3.fromRGB(255, random(140, 180), random(180, 230)) end,
+        petalPale = function() return Color3.fromRGB(255, random(200, 230), 255) end,
+    }
+
+    ----------------------------------------------------------------
+    -- Particle engine
+    ----------------------------------------------------------------
+
+    local POOL_LIMITS = { Circle = 40, Line = 250, Triangle = 150, Square = 100 }
+
+    local pools = {}
+    for shape, limit in pairs(POOL_LIMITS) do
+        local pool = {}
+        for _ = 1, limit do
+            table.insert(pool, Util.newDrawing(shape, {
+                Visible = false,
+                Filled = shape ~= "Circle" and shape ~= "Line",
+            }))
+        end
+        pools[shape] = pool
     end
-end
 
-local function getClosestPlayerToMouseForTracer()
-    local LocalPlayer = game:GetService("Players").LocalPlayer
-    local mouse = getMouse()
-    if not mouse then return nil end
-    local mousePos = Vector2.new(mouse.X, mouse.Y)
-    
-    local okPlayers, allPlayers = pcall(function() return game:GetService("Players"):GetPlayers() end)
-    if not okPlayers or type(allPlayers) ~= "table" then return nil end
-    
-    local closestDist = math.huge
-    local closestPlayer = nil
-    
-    local CustomW2S = type(WorldToScreen) == "function" and WorldToScreen or function(p) return Vector2.new(0,0), false end
+    local particles = {}
 
-    for _, player in ipairs(allPlayers) do
-        if player.Name ~= LocalPlayer.Name and player.Character then
-            local hrp = player.Character:FindFirstChild("HumanoidRootPart")
-            if hrp then
-                local okW2S, sc, on = pcall(CustomW2S, hrp.Position)
-                if okW2S and sc and on then
-                    local dx = mousePos.X - sc.X
-                    local dy = mousePos.Y - sc.Y
-                    local dist = math.sqrt(dx*dx + dy*dy)
-                    if dist < closestDist then
-                        closestDist = dist
-                        closestPlayer = player
+    local state = {
+        killEffects = false,
+        killEffectsSheriffOnly = false,
+        killEffectStyle = "Random",
+        killEffectVersion = "New (V2)",
+        killEffectDuration = 3,
+
+        tracers = false,
+        tracerSheriffOnly = false,
+        tracerRainbow = false,
+        tracerGlow = false,
+        tracerColor = Color3.fromRGB(0, 255, 100),
+        tracerDuration = 3,
+        tracerThickness = 1,
+        tracerLine = false,
+        tracerLineColor = Color3.fromRGB(255, 255, 255),
+        tracerLineThickness = 2,
+
+        hitSounds = false,
+        hitSoundsOnlyCustom = false,
+    }
+
+    local function spawnParticle(shape, props)
+        local limit = POOL_LIMITS[shape] or 0
+        local live = 0
+        for _, particle in ipairs(particles) do
+            if particle.shape == shape then
+                live = live + 1
+            end
+        end
+
+        if live >= limit then
+            return
+        end
+
+        props.shape = shape
+        props.life = 0
+        props.maxLife = props.maxLife or 1
+
+        -- Rings read as one flash, so only the debris is stretched by the
+        -- duration slider.
+        if shape ~= "Circle" then
+            props.maxLife = props.maxLife * state.killEffectDuration
+        end
+
+        table.insert(particles, props)
+    end
+
+    ----------------------------------------------------------------
+    -- Kill effect styles
+    ----------------------------------------------------------------
+
+    local Styles = { ["Old (V1)"] = {}, ["New (V2)"] = {} }
+
+    local V1 = Styles["Old (V1)"]
+
+    V1["Laser Eyes"] = function(pos)
+        spawnParticle("Circle", { pos = pos, r = 10, maxR = 250, maxLife = 0.6, color = Palette.RED, t = 5, shrink = true })
+        for _ = 1, 40 do
+            spawnParticle("Line", { pos = pos,
+                vel = Vector3.new(random(-150, 150), random(-50, 150), random(-150, 150)),
+                length = random(20, 50), maxLife = random(50, 80) / 100, color = Palette.RED, t = 3 })
+        end
+    end
+
+    V1["Cosmic Nova"] = function(pos)
+        spawnParticle("Circle", { pos = pos, r = 0, maxR = 300, maxLife = 0.8, color = Palette.VIOLET, t = 8 })
+        for _ = 1, 60 do
+            spawnParticle("Line", { pos = pos,
+                vel = Vector3.new(random(-100, 100), random(-100, 100), random(-100, 100)),
+                length = random(20, 50), maxLife = random(60, 100) / 100, color = Palette.CYAN, t = 3 })
+        end
+    end
+
+    V1["Blood Splatter"] = function(pos)
+        for _ = 1, 10 do
+            spawnParticle("Circle", { pos = pos + Vector3.new(random(-10, 10), random(-10, 10), random(-10, 10)),
+                r = 0, maxR = random(30, 80), maxLife = random(40, 70) / 100, color = Palette.BLOOD, t = 5 })
+        end
+        for _ = 1, 50 do
+            spawnParticle("Triangle", { pos = pos,
+                vel = Vector3.new(random(-50, 50), random(20, 60), random(-50, 50)),
+                grav = Vector3.new(0, -150, 0), rot = CFrame.Angles(0, 0, 0),
+                rotV = CFrame.Angles(math.random() * 2, 0, 0), size = 2, maxLife = 0.8,
+                color = Palette.BLOOD_DARK })
+        end
+    end
+
+    V1["Holy Smite"] = function(pos)
+        spawnParticle("Circle", { pos = pos, r = 0, maxR = 250, maxLife = 0.5, color = Palette.WHITE, t = 10 })
+        for _ = 1, 40 do
+            spawnParticle("Line", { pos = pos + Vector3.new(random(-30, 30), 200, random(-30, 30)),
+                vel = Vector3.new(0, -800, 0), length = 100, maxLife = 0.4, color = Palette.GOLD, t = 4 })
+        end
+    end
+
+    V1["Toxic Splash"] = function(pos)
+        for _ = 1, 15 do
+            spawnParticle("Circle", { pos = pos, r = 0, maxR = random(20, 60), maxLife = 0.6, color = Palette.TOXIC, t = 4 })
+        end
+        for _ = 1, 40 do
+            spawnParticle("Square", { pos = pos,
+                vel = Vector3.new(random(-40, 40), random(30, 80), random(-40, 40)),
+                grav = Vector3.new(0, -60, 0), size = 15, maxLife = 0.8, color = Palette.TOXIC })
+        end
+    end
+
+    V1["Ice Shatter"] = function(pos)
+        spawnParticle("Circle", { pos = pos, r = 0, maxR = 180, maxLife = 0.5, color = Palette.ICE, t = 5 })
+        for _ = 1, 50 do
+            spawnParticle("Triangle", { pos = pos,
+                vel = Vector3.new(random(-150, 150), random(-30, 80), random(-150, 150)),
+                grav = Vector3.new(0, -50, 0), rot = CFrame.Angles(0, 0, 0), rotV = CFrame.Angles(0, 0, 0),
+                size = 2, maxLife = 0.7, color = Palette.WHITE })
+        end
+    end
+
+    V1["Void Collapse"] = function(pos)
+        spawnParticle("Circle", { pos = pos, r = 300, maxR = 0, maxLife = 1.0, color = Palette.VOID, t = 15, shrink = true })
+        for _ = 1, 50 do
+            spawnParticle("Line", { pos = pos + Vector3.new(random(-100, 100), random(-100, 100), random(-100, 100)),
+                vel = Vector3.new(0, 0, 0), pullTarget = pos, pullSpeed = 150, length = 20, maxLife = 1.0,
+                color = Palette.VOID_LIGHT, t = 3 })
+        end
+    end
+
+    V1["Cyber Glitch"] = function(pos)
+        for _ = 1, 40 do
+            spawnParticle("Square", { pos = pos + Vector3.new(random(-40, 40), random(-40, 40), random(-40, 40)),
+                size = 20, maxLife = 0.6, color = math.random() > 0.5 and Palette.MAGENTA or Palette.CYAN })
+        end
+        for _ = 1, 40 do
+            spawnParticle("Line", { pos = pos,
+                vel = Vector3.new(random(-100, 100), random(-100, 100), random(-100, 100)), length = 30,
+                maxLife = 0.5, color = Palette.CYAN, t = 4 })
+        end
+    end
+
+    V1["Sparkler"] = function(pos)
+        spawnParticle("Circle", { pos = pos, r = 0, maxR = 150, maxLife = 0.4, color = Palette.SPARK, t = 5 })
+        for _ = 1, 60 do
+            spawnParticle("Line", { pos = pos,
+                vel = Vector3.new(random(-120, 120), random(40, 150), random(-120, 120)),
+                grav = Vector3.new(0, -100, 0), length = 15, maxLife = 0.8, color = Palette.SPARK_WARM, t = 2 })
+        end
+    end
+
+    V1["Sakura Petals"] = function(pos)
+        for _ = 1, 50 do
+            spawnParticle("Triangle", { pos = pos + Vector3.new(random(-20, 20), random(10, 40), random(-20, 20)),
+                vel = Vector3.new(random(-30, 30), random(-5, 15), random(-30, 30)),
+                grav = Vector3.new(0, -5, 0), sway = 2, rot = CFrame.Angles(0, 0, 0),
+                rotV = CFrame.Angles(0, 0, 0), size = 2, maxLife = 2.0, color = Palette.SAKURA })
+        end
+    end
+
+    local V2 = Styles["New (V2)"]
+
+    V2["Laser Eyes"] = function(pos)
+        spawnParticle("Circle", { pos = pos, r = 10, maxR = 350, maxLife = 0.8, color = Shade.laser(), color2 = Shade.ember(), t = 10, shrink = true })
+        spawnParticle("Circle", { pos = pos, r = 0, maxR = 180, maxLife = 0.6, color = Shade.ember(), color2 = Color3.fromRGB(255, 255, random(0, 100)), t = 6 })
+
+        for _ = 1, 150 do
+            spawnParticle("Line", { pos = pos,
+                vel = Vector3.new(random(-250, 250), random(-50, 300), random(-250, 250)),
+                length = random(30, 80), maxLife = random(50, 110) / 100, color = Shade.laserSpark(),
+                color2 = Shade.emberBright(), color3 = Shade.emberPale(), t = random(3, 6) })
+        end
+
+        for _ = 1, 80 do
+            spawnParticle("Triangle", { pos = pos,
+                vel = Vector3.new(random(-100, 100), random(50, 150), random(-100, 100)),
+                grav = Vector3.new(0, -120, 0),
+                rot = CFrame.Angles(math.random() * 6, math.random() * 6, math.random() * 6),
+                rotV = CFrame.Angles(random(-20, 20) / 100, random(-20, 20) / 100, random(-20, 20) / 100),
+                size = random(15, 35) / 10, maxLife = random(70, 120) / 100, color = Shade.flame(),
+                color2 = Shade.flameAsh() })
+        end
+    end
+
+    V2["Cosmic Nova"] = function(pos)
+        spawnParticle("Circle", { pos = pos, r = 0, maxR = 400, maxLife = 1.2, color = Shade.nova(), color2 = Shade.starlight(), t = 12 })
+        spawnParticle("Circle", { pos = pos, r = 0, maxR = 250, maxLife = 0.9, color = Shade.starlight(), color2 = Palette.WHITE, t = 8 })
+        spawnParticle("Circle", { pos = pos, r = 500, maxR = 0, maxLife = 1.1, color = Shade.nebula(), color2 = Shade.nebulaDark(), t = 5, shrink = true })
+
+        for _ = 1, 200 do
+            spawnParticle("Line", { pos = pos,
+                vel = Vector3.new(random(-200, 200), random(-200, 200), random(-200, 200)),
+                length = random(25, 75), maxLife = random(70, 160) / 100, color = Shade.novaDeep(),
+                color2 = Shade.starlight(), color3 = Shade.starlightPale(), t = 3 })
+        end
+
+        for _ = 1, 80 do
+            spawnParticle("Square", { pos = pos + Vector3.new(random(-100, 100), random(-100, 100), random(-100, 100)),
+                pullTarget = pos, pullSpeed = 150, size = random(20, 40), maxLife = 1.2,
+                color = Shade.novaBright(), color2 = Shade.starlight() })
+        end
+    end
+
+    V2["Blood Splatter"] = function(pos)
+        for _ = 1, 25 do
+            spawnParticle("Circle", { pos = pos + Vector3.new(random(-15, 15), random(-15, 15), random(-15, 15)),
+                r = 0, maxR = random(40, 120), maxLife = random(50, 90) / 100, color = Shade.blood(),
+                color2 = Shade.bloodBright(), t = random(6, 12) })
+        end
+
+        for _ = 1, 150 do
+            spawnParticle("Line", { pos = pos,
+                vel = Vector3.new(random(-100, 100), random(-30, 120), random(-100, 100)),
+                grav = Vector3.new(0, -200, 0), length = random(15, 45), maxLife = random(80, 180) / 100,
+                color = Shade.bloodBright(), color2 = Shade.bloodDeep(), t = random(4, 8) })
+        end
+
+        for _ = 1, 100 do
+            spawnParticle("Triangle", { pos = pos,
+                vel = Vector3.new(random(-60, 60), random(20, 80), random(-60, 60)),
+                grav = Vector3.new(0, -250, 0),
+                rot = CFrame.Angles(math.random() * 6, math.random() * 6, math.random() * 6),
+                rotV = CFrame.Angles(math.random() * 3, 0, 0), size = random(15, 30) / 10,
+                maxLife = random(80, 150) / 100, color = Shade.bloodClot(), color2 = Shade.bloodDry() })
+        end
+    end
+
+    V2["Holy Smite"] = function(pos)
+        spawnParticle("Circle", { pos = pos, r = 0, maxR = 600, maxLife = 1.2, color = Palette.WHITE, color2 = Palette.GOLD, t = 30, shrink = true })
+        spawnParticle("Circle", { pos = pos, r = 200, maxR = 0, maxLife = 0.8, color = Palette.HOLY_WARM, t = 15 })
+
+        -- Ground impact shockwave
+        for _ = 1, 100 do
+            spawnParticle("Line", { pos = pos, vel = Vector3.new(random(-600, 600), 0, random(-600, 600)),
+                length = random(40, 120), maxLife = 0.6, color = Palette.WHITE, color2 = Palette.GOLD, t = 6 })
+        end
+
+        -- Celestial ascension
+        for _ = 1, 80 do
+            spawnParticle("Square", { pos = pos + Vector3.new(random(-100, 100), random(0, 50), random(-100, 100)),
+                vel = Vector3.new(0, random(200, 500), 0), size = random(20, 50), maxLife = 1.2,
+                color = Shade.holyGold(), color2 = Palette.WHITE, flicker = true })
+        end
+
+        -- Divine spears from above
+        for _ = 1, 60 do
+            spawnParticle("Line", { pos = pos + Vector3.new(random(-150, 150), random(300, 800), random(-150, 150)),
+                vel = Vector3.new(0, -1500, 0), length = random(150, 300), maxLife = 0.5, color = Palette.WHITE,
+                color2 = Shade.holySpear(), t = 12 })
+        end
+    end
+
+    V2["Toxic Splash"] = function(pos)
+        for _ = 1, 35 do
+            spawnParticle("Circle", { pos = pos + Vector3.new(random(-25, 25), random(-15, 30), random(-25, 25)),
+                r = 0, maxR = random(30, 90), maxLife = random(50, 140) / 100, color = Shade.toxic(),
+                color2 = Shade.toxicDeep(), t = random(4, 10) })
+        end
+
+        for _ = 1, 120 do
+            spawnParticle("Triangle", { pos = pos,
+                vel = Vector3.new(random(-60, 60), random(30, 100), random(-60, 60)),
+                grav = Vector3.new(0, -60, 0), rot = CFrame.Angles(0, 0, 0),
+                rotV = CFrame.Angles(math.random() * 0.2, math.random() * 0.2, 0), size = random(15, 30) / 10,
+                maxLife = random(80, 180) / 100, color = Shade.toxicLeaf(), color2 = Shade.toxicShadow() })
+        end
+
+        for _ = 1, 60 do
+            spawnParticle("Square", { pos = pos,
+                vel = Vector3.new(random(-40, 40), random(50, 120), random(-40, 40)),
+                grav = Vector3.new(0, -80, 0), size = random(15, 25), maxLife = random(60, 140) / 100,
+                color = Shade.toxic() })
+        end
+    end
+
+    V2["Ice Shatter"] = function(pos)
+        for _ = 1, 15 do
+            spawnParticle("Circle", { pos = pos, r = 0, maxR = random(150, 250), maxLife = 0.6,
+                color = Shade.ice(), color2 = Palette.WHITE, t = 5 })
+        end
+
+        for _ = 1, 150 do
+            spawnParticle("Triangle", { pos = pos,
+                vel = Vector3.new(random(-200, 200), random(-50, 100), random(-200, 200)),
+                grav = Vector3.new(0, -80, 0),
+                rot = CFrame.Angles(math.random() * 6, math.random() * 6, math.random() * 6),
+                rotV = CFrame.Angles(math.random() * 0.4, 0, 0), size = random(15, 40) / 10,
+                maxLife = random(60, 120) / 100, color = Shade.iceShard(), color2 = Palette.WHITE })
+        end
+
+        for _ = 1, 100 do
+            spawnParticle("Line", { pos = pos,
+                vel = Vector3.new(random(-250, 250), random(-50, 50), random(-250, 250)),
+                length = random(25, 70), maxLife = 0.6, color = Shade.iceMist(), color2 = Palette.WHITE,
+                t = 4 })
+        end
+    end
+
+    V2["Void Collapse"] = function(pos)
+        spawnParticle("Circle", { pos = pos, r = 450, maxR = 0, maxLife = 1.4, color = Palette.BLACK, color2 = Shade.voidCore(), t = 25, shrink = true })
+        spawnParticle("Circle", { pos = pos, r = 300, maxR = 0, maxLife = 1.0, color = Shade.voidInner(), color2 = Shade.voidRim(), t = 15, shrink = true })
+
+        for _ = 1, 150 do
+            spawnParticle("Line", { pos = pos + Vector3.new(random(-150, 150), random(-150, 150), random(-150, 150)),
+                vel = Vector3.new(0, 0, 0), pullTarget = pos, pullSpeed = random(150, 300),
+                length = random(25, 50), maxLife = 1.4, color = Shade.voidStrand(), color2 = Palette.BLACK,
+                t = 5 })
+        end
+
+        for _ = 1, 100 do
+            spawnParticle("Triangle", { pos = pos + Vector3.new(random(-100, 100), random(-100, 100), random(-100, 100)),
+                pullTarget = pos, pullSpeed = 200,
+                rot = CFrame.Angles(math.random() * 6, math.random() * 6, math.random() * 6),
+                rotV = CFrame.Angles(0.2, 0.2, 0.2), size = random(20, 35) / 10, maxLife = 1.4,
+                color = Shade.voidDust(), color2 = Shade.novaBright() })
+        end
+    end
+
+    V2["Cyber Glitch"] = function(pos)
+        for _ = 1, 100 do
+            spawnParticle("Square", { pos = pos + Vector3.new(random(-60, 60), random(-60, 60), random(-60, 60)),
+                size = random(25, 60), maxLife = random(40, 100) / 100,
+                color = math.random() > 0.5 and Shade.glitchPink() or Shade.glitchCyan(),
+                color2 = Palette.WHITE, flicker = true })
+        end
+
+        for _ = 1, 150 do
+            spawnParticle("Line", { pos = pos + Vector3.new(random(-50, 50), random(-50, 50), random(-50, 50)),
+                vel = Vector3.new(random(-150, 150), random(-150, 150), random(-150, 150)),
+                length = random(30, 100), maxLife = random(40, 90) / 100, color = Shade.glitchCyan(),
+                color2 = Shade.glitchPink(), t = 7, flicker = true })
+        end
+    end
+
+    V2["Sparkler"] = function(pos)
+        spawnParticle("Circle", { pos = pos, r = 0, maxR = 200, maxLife = 0.5, color = Shade.sparkCore(), color2 = Palette.WHITE, t = 8 })
+
+        for _ = 1, 200 do
+            spawnParticle("Line", { pos = pos,
+                vel = Vector3.new(random(-180, 180), random(50, 200), random(-180, 180)),
+                grav = Vector3.new(0, -150, 0), length = random(10, 25), maxLife = random(70, 150) / 100,
+                color = Shade.sparkTrail(), color2 = Shade.sparkFade(), t = 4 })
+        end
+
+        for _ = 1, 80 do
+            spawnParticle("Triangle", { pos = pos,
+                vel = Vector3.new(random(-120, 120), random(80, 250), random(-120, 120)),
+                grav = Vector3.new(0, -180, 0),
+                rot = CFrame.Angles(math.random() * 6, math.random() * 6, math.random() * 6),
+                rotV = CFrame.Angles(math.random() * 0.5, math.random() * 0.5, 0), size = random(10, 20) / 10,
+                maxLife = random(70, 140) / 100, color = Shade.sparkShard(), color2 = Palette.WHITE })
+        end
+    end
+
+    V2["Sakura Petals"] = function(pos)
+        for _ = 1, 150 do
+            spawnParticle("Triangle", { pos = pos + Vector3.new(random(-30, 30), random(10, 60), random(-30, 30)),
+                vel = Vector3.new(random(-50, 50), random(-5, 25), random(-50, 50)),
+                grav = Vector3.new(0, -10, 0), sway = random(20, 50) / 10,
+                rot = CFrame.Angles(math.random() * 6, math.random() * 6, math.random() * 6),
+                rotV = CFrame.Angles(0.02, 0.05, 0.02), size = random(15, 30) / 10,
+                maxLife = random(250, 500) / 100, color = Shade.petal(), color2 = Shade.petalPale() })
+        end
+    end
+
+    local STYLE_NAMES = {
+        "Laser Eyes", "Cosmic Nova", "Blood Splatter", "Holy Smite", "Toxic Splash",
+        "Ice Shatter", "Void Collapse", "Cyber Glitch", "Sparkler", "Sakura Petals",
+    }
+
+    local styleCursor = 0
+
+    local function triggerKillEffect(position, styleName)
+        if styleName == "Random" then
+            styleCursor = styleCursor + random(1, 5)
+            styleName = STYLE_NAMES[(styleCursor % #STYLE_NAMES) + 1]
+        end
+
+        local set = Styles[state.killEffectVersion] or Styles["New (V2)"]
+        local spawn = set[styleName]
+        if spawn then
+            spawn(position)
+        end
+    end
+
+    ----------------------------------------------------------------
+    -- Particle rendering
+    ----------------------------------------------------------------
+
+    Scheduler.onRender("vfx.particles", function(dt)
+        if not state.killEffects and #particles == 0 then
+            return
+        end
+
+        local used = { Circle = 0, Line = 0, Triangle = 0, Square = 0 }
+
+        for index = #particles, 1, -1 do
+            local particle = particles[index]
+            particle.life = particle.life + dt
+
+            if particle.life >= particle.maxLife then
+                table.remove(particles, index)
+            else
+                local progress = particle.life / particle.maxLife
+
+                if particle.vel then
+                    particle.pos = particle.pos + particle.vel * dt
+                    particle.vel = particle.vel * (1 - math.min(1, dt * 3))
+                end
+                if particle.grav then
+                    particle.vel = particle.vel + particle.grav * dt
+                    particle.grav = particle.grav * (1 - math.min(1, dt * 2))
+                end
+                if particle.pullTarget then
+                    local direction = particle.pullTarget - particle.pos
+                    if direction.Magnitude > 1 then
+                        particle.pos = particle.pos + direction.Unit * particle.pullSpeed * dt
+                    end
+                end
+                if particle.sway then
+                    particle.pos = particle.pos + Vector3.new(
+                        math.sin(particle.life * particle.sway) * 5 * dt,
+                        0,
+                        math.cos(particle.life * particle.sway * 0.7) * 5 * dt
+                    )
+                end
+                if particle.rot then
+                    particle.rot = particle.rot * particle.rotV
+                end
+
+                local screenPos, onScreen = worldToScreen(particle.pos)
+
+                if onScreen then
+                    local color = particle.color
+                    if particle.color2 then
+                        if progress < 0.5 then
+                            color = lerpColor(particle.color, particle.color2, progress * 2)
+                        else
+                            color = lerpColor(particle.color2, particle.color3 or particle.color2, (progress - 0.5) * 2)
+                        end
+                    end
+
+                    if particle.flicker and math.random() > 0.5 then
+                        color = Palette.WHITE
+                    end
+
+                    local shape = particle.shape
+
+                    if shape == "Circle" and used.Circle < POOL_LIMITS.Circle then
+                        used.Circle = used.Circle + 1
+                        local circle = pools.Circle[used.Circle]
+                        if particle.shrink then
+                            circle.Radius = particle.r - ((particle.r - particle.maxR) * progress)
+                        else
+                            circle.Radius = particle.r + ((particle.maxR - particle.r) * math.pow(progress, 0.5))
+                        end
+                        circle.Position = screenPos
+                        circle.Color = color
+                        circle.Transparency = 1 - progress
+                        circle.Thickness = math.max(1, (particle.t or 5) * (1 - progress))
+                        circle.Visible = true
+
+                    elseif shape == "Line" and used.Line < POOL_LIMITS.Line then
+                        local tail = particle.pos - (particle.vel and particle.vel.Unit * particle.length or Vector3.new(0, particle.length, 0))
+                        local tailPos, tailOnScreen = worldToScreen(tail)
+                        if tailOnScreen then
+                            used.Line = used.Line + 1
+                            local line = pools.Line[used.Line]
+                            line.From = tailPos
+                            line.To = screenPos
+                            line.Color = color
+                            line.Transparency = 1 - progress
+                            line.Thickness = particle.t or 2
+                            line.Visible = true
+                        end
+
+                    elseif shape == "Triangle" and used.Triangle < POOL_LIMITS.Triangle then
+                        local size = particle.size * (1 - progress)
+                        local a, aOn = worldToScreen(particle.pos + (particle.rot * Vector3.new(0, size, 0)))
+                        local b, bOn = worldToScreen(particle.pos + (particle.rot * Vector3.new(-size, -size, 0)))
+                        local c, cOn = worldToScreen(particle.pos + (particle.rot * Vector3.new(size, -size, 0)))
+                        if aOn and bOn and cOn then
+                            used.Triangle = used.Triangle + 1
+                            local triangle = pools.Triangle[used.Triangle]
+                            triangle.PointA, triangle.PointB, triangle.PointC = a, b, c
+                            triangle.Color = color
+                            triangle.Transparency = 1 - progress
+                            triangle.Visible = true
+                        end
+
+                    elseif shape == "Square" and used.Square < POOL_LIMITS.Square then
+                        used.Square = used.Square + 1
+                        local square = pools.Square[used.Square]
+                        if particle.flicker then
+                            square.Position = screenPos + Vector2.new(random(-10, 10), random(-10, 10))
+                            square.Transparency = math.random() > 0.5 and 1 or 0
+                        else
+                            square.Position = screenPos - Vector2.new(particle.size / 2, particle.size / 2)
+                            square.Transparency = 1 - progress
+                        end
+                        square.Size = Vector2.new(particle.size, particle.size)
+                        square.Color = color
+                        square.Visible = true
                     end
                 end
             end
         end
-    end
-    
-    return closestPlayer
-end
 
-local wasMousePressed = false
-local sheriffHadGun = false
-local sheriffMurdererName = nil
-local sheriffMurdererHealth = 100
-local sheriffLastTarget = nil
-
-RunService.RenderStepped:Connect(function()
-    if not HitTracerEnabled and not (KillEffectEnabled and not KillEffectSheriffOnly) then return end
-    
-    local isPressed = (type(ismouse1pressed) == "function" and ismouse1pressed()) or false
-    
-    if isPressed and not wasMousePressed then
-        local lp = game:GetService("Players").LocalPlayer
-        local char = lp and lp.Character
-        local isHoldingGun = char and char:FindFirstChild("Gun")
-        
-        local canShoot = true
-        if HitTracerEnabled and HitTracerSheriffOnly then
-            if not isHoldingGun or (os.clock() - lastHitTracerShot) < 2 then
-                canShoot = false
+        for shape, limit in pairs(POOL_LIMITS) do
+            for index = used[shape] + 1, limit do
+                pools[shape][index].Visible = false
             end
         end
-        
-        if canShoot or (KillEffectEnabled and not KillEffectSheriffOnly) then
-            local target = getClosestPlayerToMouseForTracer()
-            if target and target.Character then
-                
+    end)
 
-                if HitTracerEnabled and canShoot then
-                    if HitTracerSheriffOnly then
-                        lastHitTracerShot = os.clock()
-                        sheriffLastTarget = target
+    ----------------------------------------------------------------
+    -- Hit tracers
+    ----------------------------------------------------------------
+
+    local CUBE_EDGES = {
+        { 1, 2 }, { 2, 3 }, { 3, 4 }, { 4, 1 },
+        { 5, 6 }, { 6, 7 }, { 7, 8 }, { 8, 5 },
+        { 1, 5 }, { 2, 6 }, { 3, 7 }, { 4, 8 },
+    }
+
+    local tracers = {}
+
+    local function newTracerLine(thickness, color, zIndex)
+        return Util.newDrawing("Line", {
+            Thickness = thickness,
+            Color = color,
+            Visible = false,
+            ZIndex = zIndex,
+        })
+    end
+
+    local function destroyTracer(tracer)
+        for _, segment in ipairs(tracer.segments) do
+            segment.line:Remove()
+            for _, glow in ipairs(segment.glow) do
+                glow:Remove()
+            end
+        end
+    end
+
+    local function spawnCubeTracer(cframe, size, duration, color)
+        local half = size / 2
+        local corners = {
+            Vector3.new(-half.X, -half.Y, -half.Z), Vector3.new(half.X, -half.Y, -half.Z),
+            Vector3.new(half.X, half.Y, -half.Z), Vector3.new(-half.X, half.Y, -half.Z),
+            Vector3.new(-half.X, -half.Y, half.Z), Vector3.new(half.X, -half.Y, half.Z),
+            Vector3.new(half.X, half.Y, half.Z), Vector3.new(-half.X, half.Y, half.Z),
+        }
+
+        local worldCorners = {}
+        for index = 1, 8 do
+            worldCorners[index] = cframe:PointToWorldSpace(corners[index])
+        end
+
+        local segments = {}
+        for _, edge in ipairs(CUBE_EDGES) do
+            local glow = {}
+            if state.tracerGlow then
+                for layer = 1, 2 do
+                    table.insert(glow, newTracerLine(state.tracerThickness + (layer * 4), color, 0))
+                end
+            end
+
+            table.insert(segments, {
+                line = newTracerLine(state.tracerThickness, color, 1),
+                glow = glow,
+                from = worldCorners[edge[1]],
+                to = worldCorners[edge[2]],
+            })
+        end
+
+        table.insert(tracers, { segments = segments, start = os.clock(), duration = duration })
+    end
+
+    local function spawnLineTracer(fromPosition, toPosition, duration, color, thickness)
+        local glow = {}
+        if state.tracerGlow then
+            table.insert(glow, newTracerLine(thickness + 4, color, 0))
+        end
+
+        table.insert(tracers, {
+            segments = { { line = newTracerLine(thickness, color, 1), glow = glow, from = fromPosition, to = toPosition } },
+            start = os.clock(),
+            duration = duration,
+        })
+    end
+
+    local function drawCharacterTracer(character, duration, color)
+        for _, part in ipairs(character:GetChildren()) do
+            if part:IsA("BasePart") and part.Name ~= "HumanoidRootPart" and part.Transparency < 1 then
+                spawnCubeTracer(part.CFrame, part.Size, duration, color)
+            end
+        end
+    end
+
+    Scheduler.onRender("vfx.tracers", function()
+        if #tracers == 0 then
+            return
+        end
+
+        local now = os.clock()
+        local rainbow = state.tracerRainbow and Color3.fromHSV((now % 2) / 2, 1, 1) or nil
+
+        for index = #tracers, 1, -1 do
+            local tracer = tracers[index]
+            local elapsed = now - tracer.start
+
+            if elapsed > tracer.duration then
+                destroyTracer(tracer)
+                table.remove(tracers, index)
+            else
+                local alpha = 1 - (elapsed / tracer.duration)
+
+                for _, segment in ipairs(tracer.segments) do
+                    local from, fromOn = worldToScreen(segment.from)
+                    local to, toOn = worldToScreen(segment.to)
+                    local line = segment.line
+
+                    if fromOn and toOn then
+                        if rainbow then
+                            line.Color = rainbow
+                        end
+                        line.From = from
+                        line.To = to
+                        line.Transparency = alpha
+                        line.Visible = true
+
+                        for layer, glow in ipairs(segment.glow) do
+                            if rainbow then
+                                glow.Color = rainbow
+                            end
+                            glow.From = from
+                            glow.To = to
+                            glow.Transparency = alpha * (0.75 - (layer * 0.2))
+                            glow.Visible = true
+                        end
                     else
-                        drawFullHitTracer(target.Character, HitTracerDuration, HitTracerColor)
-                    end
-                    
-                    if HitTracerLineEnabled then
-                        local lpChar = game:GetService("Players").LocalPlayer.Character
-                        if lpChar then
-                            local arm = lpChar:FindFirstChild("Right Arm") or lpChar:FindFirstChild("RightHand")
-                            local head = lpChar:FindFirstChild("Head")
-                            local myHrp = lpChar:FindFirstChild("HumanoidRootPart")
-                            local tHrp = target.Character:FindFirstChild("HumanoidRootPart") or target.Character:FindFirstChild("Torso")
-                            
-                            if arm and tHrp then
-                                local start3D = arm.Position
-                                local cam = game:GetService("Workspace").CurrentCamera
-                                if cam and head and myHrp then
-                                    local okCam, camPos = pcall(function() return cam.CFrame.Position end)
-                                    if okCam and camPos and (camPos - head.Position).Magnitude < 2 then
-                                        local okCF, myCF = pcall(function() return myHrp.CFrame end)
-                                        if okCF and myCF then
-                                            start3D = head.Position + (myCF.LookVector * 2) - Vector3.new(0, 0.5, 0)
-                                        end
-                                    end
-                                elseif myHrp and (arm.Position - myHrp.Position).Magnitude > 5 then
-                                    start3D = myHrp.Position
-                                end
-                                spawnHitTracerConnectionLine(start3D, tHrp.Position, HitTracerDuration, HitTracerLineColor, HitTracerLineThickness)
-                            end
+                        line.Visible = false
+                        for _, glow in ipairs(segment.glow) do
+                            glow.Visible = false
                         end
                     end
-                end
-                
-
-                if KillEffectEnabled and not KillEffectSheriffOnly then
-                    local hrp = target.Character:FindFirstChild("HumanoidRootPart")
-                    if hrp then triggerKillEffect(hrp.Position, KillEffectStyle) end
                 end
             end
         end
-    end
-    wasMousePressed = isPressed
-end)
+    end)
 
-task.spawn(function()
-    while true do
-        pcall(function()
-            if not (HitTracerEnabled and HitTracerSheriffOnly) and not (KillEffectEnabled and KillEffectSheriffOnly) and not HitSoundsEnabled then return end
-            
-            local lp = game:GetService("Players").LocalPlayer
-            local char = lp and lp.Character
-            local bp = lp and lp:FindFirstChild("Backpack")
-            
-            local hasGun = false
-            if char then
-                for _, v in ipairs(char:GetChildren()) do
-                    if v.ClassName == "Tool" and string.lower(v.Name) == "gun" then hasGun = true end
-                end
-            end
-            if bp then
-                for _, v in ipairs(bp:GetChildren()) do
-                    if v.ClassName == "Tool" and string.lower(v.Name) == "gun" then hasGun = true end
-                end
-            end
-            sheriffHadGun = hasGun
-            
-            for _, p in ipairs(Players:GetPlayers()) do
-                if p ~= lp and p.Character then
-                    local hasKnife = false
-                    for _, v in ipairs(p.Character:GetChildren()) do
-                        if v.ClassName == "Tool" and string.lower(v.Name) == "knife" then hasKnife = true end
-                    end
-                    local pBp = p:FindFirstChild("Backpack")
-                    if pBp and not hasKnife then
-                        for _, v in ipairs(pBp:GetChildren()) do
-                            if v.ClassName == "Tool" and string.lower(v.Name) == "knife" then hasKnife = true end
-                        end
-                    end
-                    
-                    if hasKnife then
-                        if sheriffMurdererName ~= p.Name then
-                            sheriffMurdererName = p.Name
-                            sheriffMurdererHealth = 100
-                        end
-                        
-                        local hum = p.Character:FindFirstChild("Humanoid")
-                        if hum then
-                            local hp = hum.Health
-                            if sheriffMurdererHealth > 0 and hp <= 0 and sheriffHadGun then
-                                if HitTracerEnabled and HitTracerSheriffOnly then
-                                    drawFullHitTracer(p.Character, HitTracerDuration, HitTracerColor)
-                                end
-                                if KillEffectEnabled and KillEffectSheriffOnly then
-                                    local hrp = p.Character:FindFirstChild("HumanoidRootPart")
-                                    if hrp then triggerKillEffect(hrp.Position, KillEffectStyle) end
-                                end
-                                if HitSoundsEnabled then
-                                    local pool = {}
-                                    local defaultTexts = {"Hit!", "Boom!", "Eliminated!", "Headshot!", "Wasted!", "Smacked!", "Oof!", "Gotcha!"}
-                                    
-                                    local activeCustoms = {}
-                                    if customSoundsCombo then
-                                        local selected = customSoundsCombo:Get()
-                                        if type(selected) == "table" then
-                                            for k, v in pairs(selected) do
-                                                if type(k) == "string" and v == true and k ~= "(None)" then table.insert(activeCustoms, k)
-                                                elseif type(v) == "string" and v ~= "(None)" then table.insert(activeCustoms, v) end
-                                            end
-                                        elseif type(selected) == "string" and selected ~= "(None)" then
-                                            table.insert(activeCustoms, selected)
-                                        end
-                                    end
+    ----------------------------------------------------------------
+    -- Hit sounds
+    ----------------------------------------------------------------
 
-                                    if HitSoundsOnlyCustom then
-                                        pool = #activeCustoms > 0 and activeCustoms or {"(No Custom Sounds)"}
-                                    else
-                                        for _, v in ipairs(defaultTexts) do table.insert(pool, v) end
-                                        for _, v in ipairs(activeCustoms) do table.insert(pool, v) end
-                                    end
-                                    
-                                    if type(notify) == "function" and #pool > 0 then
-                                        if HitSoundIndex > #pool then HitSoundIndex = 1 end
-                                        notify(pool[HitSoundIndex], "LeatherHub", 4)
-                                        HitSoundIndex = HitSoundIndex + 1
-                                    end
-                                end
-                            end
-                            sheriffMurdererHealth = hp
-                        end
-                    end
-                end
-            end
-        end)
-        task.wait(0.1)
-    end
-end)
+    local DEFAULT_HIT_TEXTS = { "Hit!", "Boom!", "Eliminated!", "Headshot!", "Wasted!", "Smacked!", "Oof!", "Gotcha!" }
 
---================================================================--
---        VISUALS UI: HIT TRACERS / KILL EFFECTS / SOUNDS         --
---================================================================--
+    local customHitTexts = { "(None)" }
+    local customSoundsDropdown
+    local hitSoundIndex = 1
 
-local tracerSec = visualsTab:Section("Hit Tracers", "Right")
+    local function selectedCustomTexts()
+        local selected = customSoundsDropdown and customSoundsDropdown:Get()
+        local out = {}
 
-tracerSec:Toggle("Enable Hit Tracers", false, function(state)
-    HitTracerEnabled = state
-end)
-
-tracerSec:Toggle("Enable Glow Effect", false, function(state)
-    HitTracerGlowEnabled = state
-end)
-
-tracerSec:Toggle("Sheriff Only Mode (Gun)", false, function(state)
-    HitTracerSheriffOnly = state
-end)
-
-tracerSec:Colorpicker("Hit Tracer Color", HitTracerColor, function(color)
-    HitTracerColor = color
-end)
-
-tracerSec:Toggle("Rainbow Tracer", false, function(state)
-    HitTracerRainbow = state
-end)
-
-tracerSec:Slider("Tracer Thickness (Box)", 1, 1, 1, 10, "", function(v)
-    HitTracerBoxThickness = v
-end)
-
-tracerSec:Slider("Tracer Duration", 3, 1, 1, 10, " sec", function(v)
-    HitTracerDuration = v
-end)
-
-tracerSec:Toggle("Enable Connecting Line", false, function(state)
-    HitTracerLineEnabled = state
-end)
-
-tracerSec:Colorpicker("Connecting Line Color", HitTracerLineColor, function(color)
-    HitTracerLineColor = color
-end)
-
-tracerSec:Slider("Connecting Line Thickness", 2, 1, 1, 10, "", function(v)
-    HitTracerLineThickness = v
-end)
-
-local effectSec = visualsTab:Section("Kill Effects", "Right")
-
-effectSec:Toggle("Enable Kill Effects", false, function(state)
-    KillEffectEnabled = state
-end)
-
-effectSec:Toggle("Sheriff Only Mode", false, function(state)
-    KillEffectSheriffOnly = state
-end)
-
-effectSec:Dropdown("Effect Style", "Random", {"Random", "Laser Eyes", "Cosmic Nova", "Blood Splatter", "Holy Smite", "Toxic Splash", "Ice Shatter", "Void Collapse", "Cyber Glitch", "Sparkler", "Sakura Petals"}, false, function(val)
-    if type(val) == "table" then
-        KillEffectStyle = val[1] or "Random"
-    else
-        KillEffectStyle = val
-    end
-end)
-
-effectSec:Dropdown("Effect Version", "New (V2)", {"New (V2)", "Old (V1)"}, false, function(val)
-    if type(val) == "table" then
-        KillEffectVersion = val[1] or "New (V2)"
-    else
-        KillEffectVersion = val
-    end
-end)
-
-effectSec:Slider("Effect Duration", 3, 1, 1, 10, "x", function(v)
-    KillEffectDurationMultiplier = v
-end)
-
-local soundSec = visualsTab:Section("Hit Sounds", "Left")
-
-soundSec:Toggle("Hit Sounds (Send Notification)", false, function(state)
-    HitSoundsEnabled = state
-end)
-
-soundSec:Toggle("Only Custom Sounds", false, function(state)
-    HitSoundsOnlyCustom = state
-end)
-
-local hitSoundInput = ""
-soundSec:Textbox("Custom Text", "", function(text)
-    hitSoundInput = text
-end)
-
-soundSec:Button("Add Custom Text", function()
-    if hitSoundInput and hitSoundInput ~= "" then
-        table.insert(CustomHitSounds, hitSoundInput)
-        if customSoundsCombo then
-            if #CustomHitSounds == 1 then
-                customSoundsCombo:RemoveChoice("(None)")
-            end
-            customSoundsCombo:AddChoice(hitSoundInput)
-        end
-        if type(notify) == "function" then
-            notify("Added: " .. hitSoundInput, "LeatherHub", 4)
-        end
-    end
-end)
-
-customSoundsCombo = soundSec:Dropdown("Added Customs", {}, {"(None)"}, true, function(val)
-end)
-
-soundSec:Button("Remove Selected Custom", function()
-    if customSoundsCombo then
-        local selected = customSoundsCombo:Get()
-        local toRemove = {}
         if type(selected) == "table" then
-            for k, v in pairs(selected) do
-                if type(k) == "string" and v == true and k ~= "(None)" then table.insert(toRemove, k)
-                elseif type(v) == "string" and v ~= "(None)" then table.insert(toRemove, v) end
+            for key, value in pairs(selected) do
+                if type(key) == "string" and value == true and key ~= "(None)" then
+                    table.insert(out, key)
+                elseif type(value) == "string" and value ~= "(None)" then
+                    table.insert(out, value)
+                end
             end
         elseif type(selected) == "string" and selected ~= "(None)" then
-            table.insert(toRemove, selected)
+            table.insert(out, selected)
         end
-        
-        for _, textToRemove in ipairs(toRemove) do
-            customSoundsCombo:RemoveChoice(textToRemove)
-            for i = #CustomHitSounds, 1, -1 do
-                if CustomHitSounds[i] == textToRemove then
-                    table.remove(CustomHitSounds, i)
-                end
+
+        return out
+    end
+
+    local function playHitSound()
+        local customs = selectedCustomTexts()
+        local pool
+
+        if state.hitSoundsOnlyCustom then
+            pool = #customs > 0 and customs or { "(No Custom Sounds)" }
+        else
+            pool = {}
+            for _, text in ipairs(DEFAULT_HIT_TEXTS) do
+                table.insert(pool, text)
+            end
+            for _, text in ipairs(customs) do
+                table.insert(pool, text)
             end
         end
-        
-        if #CustomHitSounds == 0 then
-            table.insert(CustomHitSounds, "(None)")
-            customSoundsCombo:AddChoice("(None)")
+
+        if #pool == 0 then
+            return
         end
-        if #toRemove > 0 and type(notify) == "function" then
-            notify("Removed " .. #toRemove .. " sounds", "LeatherHub", 4)
+
+        if hitSoundIndex > #pool then
+            hitSoundIndex = 1
         end
-    end
-end)
 
-soundSec:Button("Test Hit Sound", function()
-    local pool = {}
-    local defaultTexts = {"Hit!", "Boom!", "Eliminated!", "Headshot!", "Wasted!", "Smacked!", "Oof!", "Gotcha!"}
-    
-    local activeCustoms = {}
-    if customSoundsCombo then
-        local selected = customSoundsCombo:Get()
-        if type(selected) == "table" then
-            for k, v in pairs(selected) do
-                if type(k) == "string" and v == true and k ~= "(None)" then table.insert(activeCustoms, k)
-                elseif type(v) == "string" and v ~= "(None)" then table.insert(activeCustoms, v) end
-            end
-        elseif type(selected) == "string" and selected ~= "(None)" then
-            table.insert(activeCustoms, selected)
-        end
+        Ctx.notify(pool[hitSoundIndex], "LeatherHub", 4)
+        hitSoundIndex = hitSoundIndex + 1
     end
 
-    if HitSoundsOnlyCustom then
-        pool = #activeCustoms > 0 and activeCustoms or {"(No Custom Sounds)"}
-    else
-        for _, v in ipairs(defaultTexts) do table.insert(pool, v) end
-        for _, v in ipairs(activeCustoms) do table.insert(pool, v) end
-    end
-    
-    if type(notify) == "function" and #pool > 0 then
-        if HitSoundIndex > #pool then HitSoundIndex = 1 end
-        notify(pool[HitSoundIndex], "LeatherHub", 4)
-        HitSoundIndex = HitSoundIndex + 1
-    end
-end)
+    ----------------------------------------------------------------
+    -- Triggers
+    ----------------------------------------------------------------
 
---================================================================--
---                   COMBAT: MAGIC KNIFE                          --
---================================================================--
+    local lastTracerShot = 0
 
-local knifeSec = combatTab:Section("Magic Knife", "Right")
+    local function targetUnderCursor()
+        local mouse = Util.getMousePosition()
+        local closest, closestDistance = nil, math.huge
 
-local MagicKnifeEnabled = false
-
-local MagicKnifeFov = 150
-local MagicKnifeFovVisible = true
-
-local fovCircle = Drawing.new("Circle")
-fovCircle.Color = Color3.fromRGB(255, 255, 255)
-fovCircle.Thickness = 1
-fovCircle.Filled = false
-fovCircle.Visible = false
-
-local mkLockedTarget = nil
-local mkLastEPress = 0
-local mkOriginalLook = nil
-local mkRestored = false
-local Camera = workspace.CurrentCamera
-
-local function W2S(pos)
-    if type(WorldToScreen) == "function" then return WorldToScreen(pos) end
-    local w, on = Camera:WorldToViewportPoint(pos)
-    return Vector2.new(w.X, w.Y), on
-end
-
-local function checkEKey()
-    if type(iskeypressed) == "function" then return iskeypressed(0x45) end
-    return game:GetService("UserInputService"):IsKeyDown(Enum.KeyCode.E)
-end
-
-local mouse = getMouse()
-
-local currentFovPos = Vector2.new(0, 0)
-
-RunService.RenderStepped:Connect(function()
-    if not fovCircle then return end
-    
-    local isKatil = false
-    if LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("Knife") then
-        isKatil = true
-    end
-    local bp = LocalPlayer:FindFirstChild("Backpack")
-    if bp and bp:FindFirstChild("Knife") then
-        isKatil = true
-    end
-
-    if MagicKnifeFovVisible and isKatil then
-        fovCircle.Visible = MagicKnifeEnabled
-    else
-        fovCircle.Visible = false
-    end
-    fovCircle.Radius = MagicKnifeFov
-    
-    local targetPos = Vector2.new(mouse.X, mouse.Y + 58)
-    if currentFovPos.X == 0 and currentFovPos.Y == 0 then
-        currentFovPos = targetPos
-    else
-        currentFovPos = Vector2.new(
-            currentFovPos.X + (targetPos.X - currentFovPos.X) * 0.2,
-            currentFovPos.Y + (targetPos.Y - currentFovPos.Y) * 0.2
-        )
-    end
-    fovCircle.Position = currentFovPos
-end)
-
-task.spawn(function()
-    local wasPressed = false
-    while true do
-        task.wait(0.05)
-        pcall(function()
-            if not MagicKnifeEnabled then wasPressed = false return end
-            local pressed = checkEKey()
-            if pressed and not wasPressed then
-                local charFolder = workspace:FindFirstChild(LocalPlayer.Name)
-                if charFolder and charFolder:FindFirstChild("Knife") then
-
-                    local myRoot = charFolder:FindFirstChild("HumanoidRootPart")
-                    if myRoot then
-                        mkOriginalLook = myRoot.CFrame.LookVector
-                    end
-
-                    local mouseX, mouseY = mouse.X, mouse.Y
-                    local closest, closestDist = nil, math.huge
-                    for _, player in pairs(Players:GetPlayers()) do
-                        if player.Name ~= LocalPlayer.Name then
-                            local pChar = player.Character
-                            if pChar then
-                                local pHRP = pChar:FindFirstChild("HumanoidRootPart")
-                                if pHRP then
-                                    local screenPos, onScreen = W2S(pHRP.Position)
-                                    if onScreen then
-                                        local dx   = screenPos.X - mouseX
-                                        local dy   = screenPos.Y - mouseY
-                                        local dist = math.sqrt(dx*dx + dy*dy)
-                                        if dist < MagicKnifeFov and dist < closestDist then
-                                            closestDist = dist
-                                            closest     = player
-                                        end
-                                    end
-                                end
-                            end
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer then
+                local root = Util.getPlayerHRP(player)
+                if root then
+                    local position, onScreen = worldToScreen(root.Position)
+                    if onScreen then
+                        local distance = (position - mouse).Magnitude
+                        if distance < closestDistance then
+                            closestDistance, closest = distance, player
                         end
                     end
-                    mkLockedTarget = closest
-                    if mkLockedTarget and mkLockedTarget.Character and mkLockedTarget.Character:FindFirstChild("HumanoidRootPart") then
-                        Camera.CFrame = CFrame.lookAt(Camera.CFrame.Position, mkLockedTarget.Character.HumanoidRootPart.Position)
-                    end
-                    mkLastEPress = os.clock()
-                    mkRestored   = false
                 end
             end
-            wasPressed = pressed
-        end)
+        end
+
+        return closest
     end
+
+    local function tracerOrigin()
+        local character = LocalPlayer.Character
+        if not character then
+            return nil
+        end
+
+        local arm = character:FindFirstChild("Right Arm") or character:FindFirstChild("RightHand")
+        if not arm then
+            return nil
+        end
+
+        local head = character:FindFirstChild("Head")
+        local root = Util.getHRP()
+        local camera = Services.Workspace.CurrentCamera
+
+        if camera and head and root and (camera.CFrame.Position - head.Position).Magnitude < 2 then
+            return head.Position + (root.CFrame.LookVector * 2) - Vector3.new(0, 0.5, 0)
+        end
+
+        if root and (arm.Position - root.Position).Magnitude > 5 then
+            return root.Position
+        end
+
+        return arm.Position
+    end
+
+    local mouseWasDown = false
+
+    Scheduler.onRender("vfx.shotWatcher", function()
+        local wantsTracer = state.tracers
+        local wantsEffect = state.killEffects and not state.killEffectsSheriffOnly
+        if not wantsTracer and not wantsEffect then
+            mouseWasDown = false
+            return
+        end
+
+        local isDown = Util.isMouse1Down()
+        if not isDown or mouseWasDown then
+            mouseWasDown = isDown
+            return
+        end
+        mouseWasDown = true
+
+        local canTrace = state.tracers
+        if canTrace and state.tracerSheriffOnly then
+            local character = LocalPlayer.Character
+            local holdingGun = character and character:FindFirstChild("Gun") ~= nil
+            canTrace = holdingGun and (os.clock() - lastTracerShot) >= 2
+        end
+
+        if not canTrace and not wantsEffect then
+            return
+        end
+
+        local target = targetUnderCursor()
+        local character = target and target.Character
+        if not character then
+            return
+        end
+
+        if canTrace then
+            if state.tracerSheriffOnly then
+                lastTracerShot = os.clock()
+            else
+                drawCharacterTracer(character, state.tracerDuration, state.tracerColor)
+            end
+
+            if state.tracerLine then
+                local origin = tracerOrigin()
+                local targetRoot = Util.getPlayerHRP(target) or character:FindFirstChild("Torso")
+                if origin and targetRoot then
+                    spawnLineTracer(origin, targetRoot.Position, state.tracerDuration, state.tracerLineColor, state.tracerLineThickness)
+                end
+            end
+        end
+
+        if wantsEffect then
+            local targetRoot = Util.getPlayerHRP(target)
+            if targetRoot then
+                triggerKillEffect(targetRoot.Position, state.killEffectStyle)
+            end
+        end
+    end)
+
+    local watchedMurderer, watchedHealth = nil, 100
+
+    Scheduler.every("vfx.sheriffWatcher", 0.1, function()
+        local needsWatcher = (state.tracers and state.tracerSheriffOnly)
+            or (state.killEffects and state.killEffectsSheriffOnly)
+            or state.hitSounds
+        if not needsWatcher then
+            return
+        end
+
+        local weHaveGun = Util.playerHasTool(LocalPlayer, "Gun")
+
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer and player.Character and Util.playerHasTool(player, "Knife") then
+                if watchedMurderer ~= player.Name then
+                    watchedMurderer = player.Name
+                    watchedHealth = 100
+                end
+
+                local humanoid = player.Character:FindFirstChildOfClass("Humanoid")
+                if humanoid then
+                    local health = humanoid.Health
+
+                    if watchedHealth > 0 and health <= 0 and weHaveGun then
+                        if state.tracers and state.tracerSheriffOnly then
+                            drawCharacterTracer(player.Character, state.tracerDuration, state.tracerColor)
+                        end
+
+                        if state.killEffects and state.killEffectsSheriffOnly then
+                            local root = Util.getPlayerHRP(player)
+                            if root then
+                                triggerKillEffect(root.Position, state.killEffectStyle)
+                            end
+                        end
+
+                        if state.hitSounds then
+                            playHitSound()
+                        end
+                    end
+
+                    watchedHealth = health
+                end
+            end
+        end
+    end)
+
+    ----------------------------------------------------------------
+    -- UI
+    ----------------------------------------------------------------
+
+    local tracerSection = visualsTab:Section("Hit Tracers", "Right")
+
+    tracerSection:Toggle("Enable Hit Tracers", false, function(enabled)
+        state.tracers = enabled
+    end)
+
+    tracerSection:Toggle("Enable Glow Effect", false, function(enabled)
+        state.tracerGlow = enabled
+    end)
+
+    tracerSection:Toggle("Sheriff Only Mode (Gun)", false, function(enabled)
+        state.tracerSheriffOnly = enabled
+    end)
+
+    tracerSection:Colorpicker("Hit Tracer Color", state.tracerColor, function(color)
+        state.tracerColor = color
+    end)
+
+    tracerSection:Toggle("Rainbow Tracer", false, function(enabled)
+        state.tracerRainbow = enabled
+    end)
+
+    tracerSection:Slider("Tracer Thickness (Box)", 1, 1, 1, 10, "", function(value)
+        state.tracerThickness = value
+    end)
+
+    tracerSection:Slider("Tracer Duration", 3, 1, 1, 10, " sec", function(value)
+        state.tracerDuration = value
+    end)
+
+    tracerSection:Toggle("Enable Connecting Line", false, function(enabled)
+        state.tracerLine = enabled
+    end)
+
+    tracerSection:Colorpicker("Connecting Line Color", state.tracerLineColor, function(color)
+        state.tracerLineColor = color
+    end)
+
+    tracerSection:Slider("Connecting Line Thickness", 2, 1, 1, 10, "", function(value)
+        state.tracerLineThickness = value
+    end)
+
+    local effectSection = visualsTab:Section("Kill Effects", "Right")
+
+    effectSection:Toggle("Enable Kill Effects", false, function(enabled)
+        state.killEffects = enabled
+    end)
+
+    effectSection:Toggle("Sheriff Only Mode", false, function(enabled)
+        state.killEffectsSheriffOnly = enabled
+    end)
+
+    local styleOptions = { "Random" }
+    for _, name in ipairs(STYLE_NAMES) do
+        table.insert(styleOptions, name)
+    end
+
+    effectSection:Dropdown("Effect Style", "Random", styleOptions, false, function(value)
+        state.killEffectStyle = type(value) == "table" and (value[1] or "Random") or value
+    end)
+
+    effectSection:Dropdown("Effect Version", "New (V2)", { "New (V2)", "Old (V1)" }, false, function(value)
+        state.killEffectVersion = type(value) == "table" and (value[1] or "New (V2)") or value
+    end)
+
+    effectSection:Slider("Effect Duration", 3, 1, 1, 10, "x", function(value)
+        state.killEffectDuration = value
+    end)
+
+    local soundSection = visualsTab:Section("Hit Sounds", "Left")
+
+    soundSection:Toggle("Hit Sounds (Send Notification)", false, function(enabled)
+        state.hitSounds = enabled
+    end)
+
+    soundSection:Toggle("Only Custom Sounds", false, function(enabled)
+        state.hitSoundsOnlyCustom = enabled
+    end)
+
+    local pendingCustomText = ""
+
+    soundSection:Textbox("Custom Text", "", function(text)
+        pendingCustomText = text
+    end)
+
+    soundSection:Button("Add Custom Text", function()
+        if pendingCustomText == "" then
+            return
+        end
+
+        if #customHitTexts == 1 and customHitTexts[1] == "(None)" then
+            table.remove(customHitTexts, 1)
+            customSoundsDropdown:RemoveChoice("(None)")
+        end
+
+        table.insert(customHitTexts, pendingCustomText)
+        customSoundsDropdown:AddChoice(pendingCustomText)
+        Ctx.notify("Added: " .. pendingCustomText, "LeatherHub", 4)
+    end)
+
+    customSoundsDropdown = soundSection:Dropdown("Added Customs", {}, { "(None)" }, true, nil)
+
+    soundSection:Button("Remove Selected Custom", function()
+        local selected = selectedCustomTexts()
+
+        for _, text in ipairs(selected) do
+            customSoundsDropdown:RemoveChoice(text)
+            for index = #customHitTexts, 1, -1 do
+                if customHitTexts[index] == text then
+                    table.remove(customHitTexts, index)
+                end
+            end
+        end
+
+        if #customHitTexts == 0 then
+            table.insert(customHitTexts, "(None)")
+            customSoundsDropdown:AddChoice("(None)")
+        end
+
+        if #selected > 0 then
+            Ctx.notify("Removed " .. #selected .. " sounds", "LeatherHub", 4)
+        end
+    end)
+
+    soundSection:Button("Test Hit Sound", playHitSound)
 end)
 
-RunService.Heartbeat:Connect(function()
-    pcall(function()
-        if not MagicKnifeEnabled then return end
-        if mkLastEPress == 0 then return end
-        if not mkLockedTarget then return end
-        local elapsed = os.clock() - mkLastEPress
+--================================================================--
+--                   MODULE: MAGIC KNIFE                          --
+--================================================================--
 
-        if elapsed > 1.1 then
-            if not mkRestored and mkOriginalLook then
-                local charFolder = workspace:FindFirstChild(LocalPlayer.Name)
-                if charFolder then
-                    local myRoot = charFolder:FindFirstChild("HumanoidRootPart")
-                    if myRoot then
-                        Camera.CFrame = CFrame.lookAt(Camera.CFrame.Position, Camera.CFrame.Position + myRoot.CFrame.LookVector)
-                        mkRestored = true
+defineModule("magicKnife", function(Ctx)
+    local Lib = Ctx.Lib
+    local Players = Services.Players
+    local Workspace = Services.Workspace
+    local worldToScreen = Util.worldToScreen
+
+    local E_KEY = 0x45
+    local LOCK_START = 0.85   
+    local LOCK_END = 1.1      
+    local FOV_SMOOTHING = 0.2
+
+    local state = {
+        enabled = false,
+        showFov = true,
+        fovRadius = 150,
+    }
+
+    local fovCircle = Util.newDrawing("Circle", {
+        Color = Color3.fromRGB(255, 255, 255),
+        Thickness = 1,
+        Filled = false,
+        Visible = false,
+    })
+
+    local lockedTarget = nil
+    local lockedAt = 0
+    local cameraReleased = true
+    local fovPosition = nil
+
+    local function holdingKnife()
+        return Util.playerHasTool(LocalPlayer, "Knife")
+    end
+
+    ----------------------------------------------------------------
+    -- FOV circle
+    ----------------------------------------------------------------
+
+    Scheduler.onRender("magicKnife.fov", function()
+        fovCircle.Visible = state.enabled and state.showFov and holdingKnife()
+        if not fovCircle.Visible then
+            return
+        end
+
+        fovCircle.Radius = state.fovRadius
+
+        local target = Util.getMouseScreenPosition()
+        if not fovPosition then
+            fovPosition = target
+        else
+            fovPosition = fovPosition + (target - fovPosition) * FOV_SMOOTHING
+        end
+
+        fovCircle.Position = fovPosition
+    end)
+
+    ----------------------------------------------------------------
+    -- Target lock
+    ----------------------------------------------------------------
+
+    local function closestTargetInFov()
+        local mouse = Util.getMousePosition()
+        local closest, closestDistance = nil, math.huge
+
+        for _, player in ipairs(Players:GetPlayers()) do
+            if player ~= LocalPlayer then
+                local root = Util.getPlayerHRP(player)
+                if root then
+                    local position, onScreen = worldToScreen(root.Position)
+                    if onScreen then
+                        local distance = (position - mouse).Magnitude
+                        if distance < state.fovRadius and distance < closestDistance then
+                            closestDistance, closest = distance, player
+                        end
                     end
                 end
+            end
+        end
+
+        return closest
+    end
+
+    local ePressed = false
+
+    Scheduler.every("magicKnife.input", 0.05, function()
+        if not state.enabled then
+            ePressed = false
+            return
+        end
+
+        local pressed = Util.isKeyDown(E_KEY, Enum.KeyCode.E)
+        if pressed and not ePressed then
+            ePressed = true
+
+            local character = LocalPlayer.Character
+            if character and character:FindFirstChild("Knife") then
+                lockedTarget = closestTargetInFov()
+
+                local targetRoot = lockedTarget and Util.getPlayerHRP(lockedTarget)
+                local camera = Workspace.CurrentCamera
+                if targetRoot and camera then
+                    camera.CFrame = CFrame.lookAt(camera.CFrame.Position, targetRoot.Position)
+                end
+
+                lockedAt = os.clock()
+                cameraReleased = false
+            end
+        elseif not pressed then
+            ePressed = false
+        end
+    end)
+
+    Scheduler.onHeartbeat("magicKnife.follow", function()
+        if not state.enabled or not lockedTarget or lockedAt == 0 then
+            return
+        end
+
+        local character = LocalPlayer.Character
+        local camera = Workspace.CurrentCamera
+        local elapsed = os.clock() - lockedAt
+
+        if elapsed > LOCK_END then
+            if not cameraReleased then
+                local root = Util.getHRP()
+                if root and camera then
+                    camera.CFrame = CFrame.lookAt(camera.CFrame.Position, camera.CFrame.Position + root.CFrame.LookVector)
+                end
+                cameraReleased = true
             end
             return
         end
 
-        if elapsed < 0.85 then return end
+        if elapsed < LOCK_START or not character then
+            return
+        end
 
-        local charFolder = workspace:FindFirstChild(LocalPlayer.Name)
-        if not charFolder then return end
-        local knife  = charFolder:FindFirstChild("Knife")
-        if not knife then return end
-        local handle = knife:FindFirstChild("Handle")
-        if not handle then return end
-        local tChar = mkLockedTarget.Character
-        if not tChar then return end
-        local tHRP  = tChar:FindFirstChild("HumanoidRootPart")
-        if not tHRP then return end
-        local myRoot = charFolder:FindFirstChild("HumanoidRootPart")
-        if not myRoot then return end
+        local knife = character:FindFirstChild("Knife")
+        local handle = knife and knife:FindFirstChild("Handle")
+        local targetRoot = Util.getPlayerHRP(lockedTarget)
+        if not (handle and targetRoot) then
+            return
+        end
 
-        handle.CFrame = tHRP.CFrame
+        handle.CFrame = targetRoot.CFrame
 
-        for _, child in ipairs(workspace:GetChildren()) do
+        for _, child in ipairs(Workspace:GetChildren()) do
             if child.Name == "Knife" and child:IsA("BasePart") then
-                child.CFrame = tHRP.CFrame
+                child.CFrame = targetRoot.CFrame
             end
         end
     end)
-end)
 
-knifeSec:Toggle("Knife Teleport", false, function(state)
-    MagicKnifeEnabled = state
-    if state then
-        Lib:Notify("Magic Knife", "Silent Aim enabled! Equip knife and press E to throw at nearest player.", 4, "success")
-    else
-        Lib:Notify("Magic Knife", "Silent Aim disabled.", 3, "warning")
-    end
-end)
+    ----------------------------------------------------------------
+    -- UI
+    ----------------------------------------------------------------
 
-knifeSec:Toggle("Show FOV Circle", true, function(state)
-    MagicKnifeFovVisible = state
-end)
+    local knifeSection = Ctx.tabs.combat:Section("Magic Knife", "Right")
 
-knifeSec:Slider("FOV Radius", 150, 10, 10, 300, "", function(v)
-    MagicKnifeFov = v
-end)
+    knifeSection:Toggle("Knife Teleport", false, function(enabled)
+        state.enabled = enabled
+        if enabled then
+            Lib:Notify("Magic Knife", "Silent Aim enabled! Equip knife and press E to throw at nearest player.", 4, "success")
+        else
+            lockedTarget = nil
+            lockedAt = 0
+            Lib:Notify("Magic Knife", "Silent Aim disabled.", 3, "warning")
+        end
+    end)
 
-knifeSec:Colorpicker("FOV Circle Color", Color3.fromRGB(255, 255, 255), function(color)
-    if fovCircle then fovCircle.Color = color end
+    knifeSection:Toggle("Show FOV Circle", true, function(enabled)
+        state.showFov = enabled
+    end)
+
+    knifeSection:Slider("FOV Radius", 150, 10, 10, 300, "", function(value)
+        state.fovRadius = value
+    end)
+
+    knifeSection:Colorpicker("FOV Circle Color", Color3.fromRGB(255, 255, 255), function(color)
+        fovCircle.Color = color
+    end)
 end)
 
 --================================================================--
---                      TAB: AUTO FARM                            --
+--                      MODULE: AUTO FARM                         --
 --================================================================--
 
-local farmTab = win:Tab("Auto Farm", "zap")
-local farmSec = farmTab:Section("Coin Farm", "Left")
+defineModule("farm", function(Ctx)
+    local Lib = Ctx.Lib
+    local Workspace = Services.Workspace
+    local SAFE_OFFSET = 5
+    local FIRST_TRIP_SPEED = 999
+    local BELOW_MAP_Y = -500
+    local MURDERER_CAMP_SPOT = CFrame.new(-1.79, -64.45, -85.25)
 
-local FarmConfig = {
-    AutoFarmEnabled = false,
-    MaxCoins = 40,
-    TweenSpeed = 25
-}
-local collectedCoinsThisRound = 0
+    local config = {
+        enabled = false,
+        killAfterFarm = false,
+        maxCoins = 40,
+        speed = 25,
+    }
 
-local HIDE_OFFSET = 6
-
-local function getHRP()
-    local c = LocalPlayer.Character
-    if c then return c:FindFirstChild("HumanoidRootPart") end
-    return nil
-end
-
-local function isAlive()
-    local c = LocalPlayer.Character
-    if not c then return false end
-    local h = c:FindFirstChild("Humanoid")
-    if not h or h.Health <= 0 then return false end
-    
-    local inRound = false
-    pcall(function()
-        local pGui = LocalPlayer:FindFirstChild("PlayerGui")
-        if pGui and pGui:FindFirstChild("MainGUI") and pGui.MainGUI:FindFirstChild("Game") then
-            inRound = true
-        end
-    end)
-    
-    if not inRound then return false end
-    
-    return true
-end
-
-local function isBagFull()
-    if collectedCoinsThisRound >= FarmConfig.MaxCoins then
-        return true
-    end
-    local current_coins = 0
-    pcall(function()
-        local pGui = LocalPlayer:FindFirstChild("PlayerGui")
-        if not pGui then return end
-        local coinBags = pGui:FindFirstChild("MainGUI") and pGui.MainGUI:FindFirstChild("Game") and pGui.MainGUI.Game:FindFirstChild("CoinBags")
-        if not coinBags then return end
-        for _, v in ipairs(coinBags:GetDescendants()) do
-            if v:IsA("TextLabel") and v.Visible then
-                local num = string.match(v.Text or "", "%d+")
-                if num then
-                    current_coins = math.max(current_coins, tonumber(num) or 0)
-                end
-            end
-        end
-    end)
-    return current_coins >= FarmConfig.MaxCoins
-end
-
-local function findCoinContainer()
-    for _, map in ipairs(workspace:GetChildren()) do
-        if map:FindFirstChild("CoinContainer") then
-            return map.CoinContainer
-        end
-    end
-    local normal = workspace:FindFirstChild("Normal")
-    if normal then
-        for _, child in ipairs(normal:GetChildren()) do
-            if child:FindFirstChild("CoinContainer") then
-                return child.CoinContainer
-            end
-        end
-        if normal:FindFirstChild("CoinContainer") then
-            return normal.CoinContainer
-        end
-    end
-    return nil
-end
-
-local function isMM2Gun(v)
-    if not v or not v:IsA("Tool") then return false end
-    return v.Name == "Gun"
-end
-
-local function isMM2Knife(v)
-    if not v or not v:IsA("Tool") then return false end
-    return v.Name == "Knife"
-end
-
-local function findMurderer()
-    for _, p in ipairs(PlayersService:GetPlayers()) do
-        if p ~= LocalPlayer and p.Character then
-            local bp = p:FindFirstChild("Backpack")
-            local function hasKnife(container)
-                if not container then return false end
-                for _, v in ipairs(container:GetChildren()) do
-                    if isMM2Knife(v) then return true end
-                end
-                return false
-            end
-            if hasKnife(p.Character) or hasKnife(bp) then
-                return p
-            end
-        end
-    end
-    return nil
-end
-
-local function getMyRole()
-    local char = LocalPlayer.Character
-    local bp = LocalPlayer:FindFirstChild("Backpack")
-    
-    local function checkItems(container)
-        if not container then return nil end
-        for _, v in ipairs(container:GetChildren()) do
-            if isMM2Gun(v) then
-                return "Sheriff"
-            elseif isMM2Knife(v) then
-                return "Murderer"
-            end
-        end
-        return nil
-    end
-    
-    local role = checkItems(char)
-    if role then return role end
-    role = checkItems(bp)
-    if role then return role end
-    
-    return "Innocent"
-end
-
-local function handlePostFarmAction()
-    local myRole = getMyRole()
-    local hrp = getHRP()
-    
-    if myRole == "Murderer" then
-        if FarmConfig.AutoKillAfterFarm then
-            if hrp then
-                hrp.CFrame = CFrame.new(-1.79, -64.45, -85.25)
-                task.wait(0.2)
-            end
-            task.spawn(function()
-                doAutoKill(true) 
-            end)
-            return true
-        end
-    else
-        if hrp then
-            hrp.CFrame = CFrame.new(hrp.Position.X, -500, hrp.Position.Z)
-        end
-        return true
-    end
-    return false
-end
-
-local farmThreadActive = false
-local antiFallConnection = nil
-local noclipConnection = nil
-
-local function getMapName()
-    local normal = workspace:FindFirstChild("Normal")
-    if normal then
-        for _, v in ipairs(normal:GetChildren()) do
-            if v:IsA("Model") or v:IsA("Folder") then
-                return string.lower(v.Name)
-            end
-        end
-    end
-    return ""
-end
-
-local function runFarm()
-    if farmThreadActive then return end
-    farmThreadActive = true
-    
-    local can = true
-    local first = true
-    local offset = 5
-    
-    local function isValid(obj) return obj and obj.Parent ~= nil end
-    local function isAlive()
-        local c = LocalPlayer.Character
-        if not c or not c:FindFirstChild("Humanoid") or c.Humanoid.Health <= 0 then return false end
-        if LocalPlayer:GetAttribute("Alive") == false then return false end
-        return true
-    end
-
-    local function magnitude(a, b)
-        local dx = a.X - b.X
-        local dy = a.Y - b.Y
-        local dz = a.Z - b.Z
-        return math.sqrt(dx * dx + dy * dy + dz * dz)
-    end
+    local farmRunning = false
 
     local function setNoclip()
-        local char = LocalPlayer and LocalPlayer.Character
-        if char and char.Parent then
-            for _, part in ipairs(char:GetChildren()) do
-                if part:IsA("BasePart") then
-                    part.CanCollide = false
+        local character = LocalPlayer.Character
+        if not (character and character.Parent) then
+            return
+        end
+        for _, part in ipairs(character:GetChildren()) do
+            if part:IsA("BasePart") then
+                part.CanCollide = false
+            end
+        end
+    end
+
+    local function restoreCollisions()
+        local character = LocalPlayer.Character
+        if not character then
+            return
+        end
+        for _, part in ipairs(character:GetDescendants()) do
+            if part:IsA("BasePart") then
+                part.CanCollide = true
+            end
+        end
+    end
+
+    local function canFarm()
+        if not Util.isAlive() then
+            return false
+        end
+        return LocalPlayer:GetAttribute("Alive") ~= false
+    end
+
+    local function getCarriedCoins()
+        local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+        local coinBags = playerGui
+            and playerGui:FindFirstChild("MainGUI")
+            and playerGui.MainGUI:FindFirstChild("Game")
+            and playerGui.MainGUI.Game:FindFirstChild("CoinBags")
+        local label = coinBags
+            and coinBags:FindFirstChild("Container")
+            and coinBags.Container:FindFirstChild("Coin")
+            and coinBags.Container.Coin:FindFirstChild("CurrencyFrame")
+        label = label and label:FindFirstChild("Icon")
+        label = label and label:FindFirstChild("Coins")
+
+        return label and tonumber(label.Text) or 0
+    end
+
+    local function roundOver()
+        local timerPart = Workspace:FindFirstChild("RoundTimerPart")
+        local remaining = timerPart and timerPart:GetAttribute("Time")
+        return remaining ~= nil and remaining <= 0
+    end
+
+    local function nearestCoin(container, position)
+        local closest, closestDistance = nil, math.huge
+
+        for _, object in ipairs(container:GetChildren()) do
+            if object.Parent and object.Name == "Coin_Server" and object:FindFirstChild("TouchInterest") then
+                local distance = (object.Position - position).Magnitude
+                if distance < closestDistance then
+                    closestDistance, closest = distance, object
                 end
             end
         end
-    end
 
-    local function findCoinContainer()
-        for _, obj in ipairs(workspace:GetChildren()) do
-            if obj:IsA("Model") then
-                local container = obj:FindFirstChild("CoinContainer")
-                if container then return container end
+        return closest
+    end
+    local function afterBagFull()
+        if Util.getPlayerRole(LocalPlayer) == "Murderer" then
+            if not config.killAfterFarm then
+                return
             end
+
+            local root = Util.getHRP()
+            if root then
+                root.CFrame = MURDERER_CAMP_SPOT
+                task.wait(0.2)
+            end
+
+            if Ctx.Combat then
+                task.spawn(Ctx.Combat.runAutoKill, true)
+            end
+            return
         end
-        return nil
+
+        local root = Util.getHRP()
+        if root then
+            root.CFrame = CFrame.new(root.Position.X, BELOW_MAP_Y, root.Position.Z)
+        end
     end
+    local function glideTo(root, coin, speed)
+        local from = root.Position - Vector3.new(0, SAFE_OFFSET, 0)
+        local to = coin.Position - Vector3.new(0, SAFE_OFFSET, 0)
+        local duration = (from - to).Magnitude / speed
 
-    if antiFallConnection then antiFallConnection:Disconnect(); antiFallConnection = nil end
-    antiFallConnection = game:GetService("RunService").Heartbeat:Connect(function()
-        if farmThreadActive and FarmConfig.AutoFarmEnabled then
-            local hrp = getHRP()
-            if hrp then hrp.Velocity = Vector3.new(0, 0, 0) end
-            setNoclip()
-        end
-    end)
-
-    if noclipConnection then noclipConnection:Disconnect(); noclipConnection = nil end
-    noclipConnection = game:GetService("RunService").Stepped:Connect(function()
-        if farmThreadActive and FarmConfig.AutoFarmEnabled then
-            setNoclip()
-        end
-    end)
-
-    while FarmConfig.AutoFarmEnabled do
-        task.wait(0.05)
-
-        local rtp = workspace:FindFirstChild("RoundTimerPart")
-        if rtp and rtp:GetAttribute("Time") and rtp:GetAttribute("Time") <= 0 then
-            first = true
-            task.wait(0.5)
-            continue
+        if duration <= 0.001 then
+            return
         end
 
-        if not isAlive() then
-            first = true
-            task.wait(0.5)
-            continue
-        end
+        local startedAt = os.clock()
+        local finished = false
+        local handle
 
-        local coins = 0
-        pcall(function()
-            coins = tonumber(LocalPlayer.PlayerGui.MainGUI.Game.CoinBags.Container.Coin.CurrencyFrame.Icon.Coins.Text) or 0
+        handle = Scheduler.onRender("farm.glide", function()
+            if not config.enabled or not canFarm() or not root.Parent or not coin.Parent then
+                finished = true
+                handle.stop()
+                return
+            end
+
+            local alpha = math.min(1, (os.clock() - startedAt) / duration)
+            root.CFrame = CFrame.new(from:Lerp(to, alpha))
+            root.AssemblyLinearVelocity = Vector3.zero
+
+            if alpha >= 1 then
+                finished = true
+                handle.stop()
+            end
         end)
 
-        if coins >= FarmConfig.MaxCoins then
-            handlePostFarmAction()
-            task.wait(1)
-            continue
-        end
-
-        local container = findCoinContainer()
-        if not container then
-            first = true
-            task.wait(0.5)
-            continue
-        end
-
-        local char = LocalPlayer.Character
-        if not char then continue end
-
-        local hrp = char:FindFirstChild("HumanoidRootPart")
-        if not hrp then continue end
-
-        local coin = nil
-        local best = math.huge
-
-        for _, obj in ipairs(container:GetChildren()) do
-            if isValid(obj) and obj.Name == "Coin_Server" and obj:FindFirstChild("TouchInterest") then
-                local dist = magnitude(obj.Position, hrp.Position)
-                if dist < best then
-                    best = dist
-                    coin = obj
-                end
-            end
-        end
-
-        setNoclip()
-
-        if coin and can and FarmConfig.AutoFarmEnabled then
-            can = false
-            local speed = first and 999 or math.max(10, FarmConfig.TweenSpeed)
-            
-            local cPos = coin.Position
-            local startPos = hrp.Position
-            local safeStart = Vector3.new(startPos.X, startPos.Y - offset, startPos.Z)
-            local safeTarget = Vector3.new(cPos.X, cPos.Y - offset, cPos.Z)
-            
-            local dist = (safeStart - safeTarget).Magnitude
-            local duration = dist / speed
-            
-            if duration > 0.001 then
-                local t0 = os.clock()
-                local finished = false
-                local conn
-                
-                conn = game:GetService("RunService").RenderStepped:Connect(function()
-                    if not FarmConfig.AutoFarmEnabled or not isAlive() or not isValid(hrp) or not isValid(coin) then
-                        finished = true
-                        conn:Disconnect()
-                        return
-                    end
-                    
-                    local elapsed = os.clock() - t0
-                    local alpha = math.min(1, elapsed / duration)
-                    
-                    local newPos = safeStart:Lerp(safeTarget, alpha)
-                    hrp.CFrame = CFrame.new(newPos.X, newPos.Y, newPos.Z)
-                    hrp.Velocity = Vector3.new(0, 0, 0)
-                    
-                    if alpha >= 1 then
-                        finished = true
-                        conn:Disconnect()
-                    end
-                end)
-                
-                while not finished do
-                    task.wait()
-                end
-            end
-            
-            if isValid(hrp) and isValid(coin) and FarmConfig.AutoFarmEnabled then
-                hrp.CFrame = CFrame.new(cPos.X, cPos.Y, cPos.Z)
-            end
-            
-            can = true
-            first = false
+        while not finished do
+            task.wait()
         end
     end
 
-    farmThreadActive = false
-    if antiFallConnection then antiFallConnection:Disconnect(); antiFallConnection = nil end
-    if noclipConnection then noclipConnection:Disconnect(); noclipConnection = nil end
-end
-
-farmSec:Toggle("Enable Auto Farm", false, function(state)
-    FarmConfig.AutoFarmEnabled = state
-    if state then
-        task.spawn(runFarm)
-        Lib:Notify("Auto Farm", "Started farming!", 3, "success")
-    else
-        local hrp = getHRP()
-        
-        
-        local character = LocalPlayer.Character
-        if character then
-            for _, v in ipairs(character:GetDescendants()) do
-                if v:IsA("BasePart") then v.CanCollide = true end
-            end
+    local function runFarm()
+        if farmRunning then
+            return
         end
-        Lib:Notify("Auto Farm", "Stopped farming.", 3, "warning")
-    end
-end)
-
-farmSec:Toggle("Kill All if Murderer (After Farm)", false, function(state)
-    FarmConfig.AutoKillAfterFarm = state
-end)
-
-farmSec:Slider("Max Coins Limit", 40, 1, 10, 50, "", function(v) FarmConfig.MaxCoins = v end)
-farmSec:Slider("Movement Speed", 25, 1, 1, 30, "", function(v) FarmConfig.TweenSpeed = v end)
-
---================================================================--
---             SETTINGS TAB / ROUND TIMER UPDATER                 --
---================================================================--
-
-win:AddSettingsTab("cog")
-
-game:GetService("RunService").Heartbeat:Connect(function()
-    pcall(function()
-        if RoundTimerEnabled then
-            local cam = workspace.CurrentCamera
-            if cam then
-                TimerLabel.Position = Vector2.new(cam.ViewportSize.X / 2, 20)
+        farmRunning = true
+        local keepAlive = Scheduler.onHeartbeat("farm.keepAlive", function()
+            local root = Util.getHRP()
+            if root then
+                root.AssemblyLinearVelocity = Vector3.zero
             end
-            
-            local timerPart = workspace:FindFirstChild("RoundTimerPart")
-            if timerPart then
-                local surfaceGui = timerPart:FindFirstChild("SurfaceGui")
-                if surfaceGui then
-                    local timerText = surfaceGui:FindFirstChild("Timer")
-                    if timerText and timerText.Text then
-                        TimerLabel.Text = "Time Left: " .. timerText.Text
-                    end
-                end
+            setNoclip()
+        end)
+
+        local firstTrip = true
+
+        while config.enabled do
+            task.wait(0.05)
+
+            if roundOver() or not canFarm() then
+                firstTrip = true
+                task.wait(0.5)
+            elseif getCarriedCoins() >= config.maxCoins then
+                afterBagFull()
+                task.wait(1)
             else
-                TimerLabel.Text = "Time Left: --:--"
+                local container = Util.findCoinContainer()
+                local root = Util.getHRP()
+
+                if not container or not root then
+                    firstTrip = true
+                    task.wait(0.5)
+                else
+                    setNoclip()
+
+                    local coin = nearestCoin(container, root.Position)
+                    if coin then
+                        glideTo(root, coin, firstTrip and FIRST_TRIP_SPEED or math.max(10, config.speed))
+
+                        if root.Parent and coin.Parent and config.enabled then
+                            root.CFrame = CFrame.new(coin.Position)
+                        end
+
+                        firstTrip = false
+                    end
+                end
             end
         end
+
+        keepAlive.stop()
+        farmRunning = false
+    end
+
+    ----------------------------------------------------------------
+    -- UI
+    ----------------------------------------------------------------
+
+    local farmSection = Ctx.tabs.farm:Section("Coin Farm", "Left")
+
+    farmSection:Toggle("Enable Auto Farm", false, function(enabled)
+        config.enabled = enabled
+        if enabled then
+            task.spawn(runFarm)
+            Lib:Notify("Auto Farm", "Started farming!", 3, "success")
+        else
+            restoreCollisions()
+            Lib:Notify("Auto Farm", "Stopped farming.", 3, "warning")
+        end
+    end)
+
+    farmSection:Toggle("Kill All if Murderer (After Farm)", false, function(enabled)
+        config.killAfterFarm = enabled
+    end)
+
+    farmSection:Slider("Max Coins Limit", 40, 1, 10, 50, "", function(value)
+        config.maxCoins = value
+    end)
+
+    farmSection:Slider("Movement Speed", 25, 1, 1, 30, "", function(value)
+        config.speed = value
     end)
 end)
 
-Lib:Notify("Success!", "Trade Checker and ESP loaded!", 5, "success")
+--================================================================--
+--                     MODULE: SETTINGS TAB                       --
+--================================================================--
 
+defineModule("settings", function(Ctx)
+    Ctx.window:AddSettingsTab("cog")
+end)
+
+--================================================================--
+--                           LOADER                               --
+--================================================================--
+
+do
+    local Ctx = {
+        Services = Services,
+        LocalPlayer = LocalPlayer,
+        Session = Session,
+        Scheduler = Scheduler,
+        Util = Util,
+    }
+
+    for _, name in ipairs(moduleOrder) do
+        local ok, err = pcall(Modules[name], Ctx)
+        if not ok then
+            warn(("[LeatherHub] module '%s' failed to load: %s"):format(name, tostring(err)))
+
+            if name == "ui" then
+                return
+            end
+        end
+    end
+
+    Ctx.Lib:Notify("Success!", "Trade Checker and ESP loaded!", 5, "success")
+end
