@@ -618,8 +618,8 @@ local decodedData = HttpService:JSONDecode(response)
 local allItems = decodedData.items
 
 local groupedItems = {}
-local dropdownOptions = {} 
-local itemValuesMap = {}   
+local dropdownOptions = {}
+local itemValuesMap = {}
 local cleanNameToFullText = {}
 
 for _, item in ipairs(allItems) do
@@ -628,16 +628,16 @@ for _, item in ipairs(allItems) do
     elseif item.name == "Gold Edlerwood Blade" then
         item.name = "Gold Elderwood Blade"
     end
-    
+
     local cat = item.category
     if not groupedItems[cat] then
         groupedItems[cat] = {}
     end
     table.insert(groupedItems[cat], item)
-    
+
     local valStr = tostring(item.value):gsub(",", "")
     local valNum = tonumber(valStr) or 0
-    
+
     local dropText = item.name .. " [Val: " .. item.value .. "]"
     itemValuesMap[dropText] = valNum
     local cleaned = item.name:lower():gsub("[^%w]", "")
@@ -657,9 +657,9 @@ table.sort(dropdownOptions, function(a, b)
 end)
 
 local function addItemToSection(section, item)
-    local text = string.format("%s | Value: %s | Demand: %s | Stability: %s", 
+    local text = string.format("%s | Value: %s | Demand: %s | Stability: %s",
         item.name, item.value, item.demand, item.stability)
-    
+
     section:Button(text, function()
         Lib:Notify(item.name, "Value: " .. item.value .. "\nPress Ctrl+C to copy", 3)
     end)
@@ -668,6 +668,15 @@ end
 --================================================================--
 --                    TAB: TRADE CHECKER                          --
 --================================================================--
+-- Reads the live MM2 trade window and scores the trade in real time.
+--
+-- NOTE: this whole tab is wrapped in a do...end block on purpose. The
+-- main chunk sits at Luau's hard ceiling of 200 locals, so anything
+-- declared at top level here would break the entire script. Scoping the
+-- tab frees its locals at the end of the block instead of holding them
+-- to end of file.
+
+do
 
 local tradeTab = win:Tab("Trade Checker", "swords")
 
@@ -675,12 +684,199 @@ local yourSec = tradeTab:Section("Your Offer", "Left")
 local theirSec = tradeTab:Section("Their Offer", "Right")
 local resSec = tradeTab:Section("Result", "Full")
 
+local MAX_SLOTS = 4 -- MM2 trades are hard-capped at 4 items per side
+
 local yourTotal = 0
 local theirTotal = 0
 
 local yourValLabel = yourSec:Label("Total Value: 0")
+local yourSlotLabels = {}
+for i = 1, MAX_SLOTS do
+    yourSlotLabels[i] = yourSec:Label("")
+end
+
 local theirValLabel = theirSec:Label("Total Value: 0")
+local theirSlotLabels = {}
+for i = 1, MAX_SLOTS do
+    theirSlotLabels[i] = theirSec:Label("")
+end
+
+local liveStatusLabel = resSec:Label("Live Mode: waiting for a trade to open...")
+local livePartnerLabel = resSec:Label("Trading with: -")
 local finalResLabel = resSec:Label("Status: Waiting for items...")
+
+--================================================================--
+--                     LIVE TRADE PLUMBING                        --
+--================================================================--
+
+local TradeRemotes = game:GetService("ReplicatedStorage"):WaitForChild("Trade")
+local TradeGUI = LocalPlayer:WaitForChild("PlayerGui"):WaitForChild("TradeGUI")
+
+-- Sync is the item database: Sync.Item == Sync.Weapons, plus Sync.Pets.
+-- Records look like { ItemName = "Seer", Rarity = "Godly", Chroma = true }.
+local Sync
+do
+    local ok, mod = pcall(function()
+        return require(game:GetService("ReplicatedStorage"):WaitForChild("Database"):WaitForChild("Sync"))
+    end)
+    Sync = ok and mod or nil
+end
+
+local liveMode = true      -- toggle
+local tradeOpen = false     -- TradeGUI.Enabled
+local haveEvent = false     -- an UpdateTrade payload arrived for this trade
+local livePartner = ""
+
+local liveYourItems, liveYourTotal, liveYourUnpriced = {}, 0, 0
+local liveTheirItems, liveTheirTotal, liveTheirUnpriced = {}, 0, 0
+
+local function comma(n)
+    local neg = ""
+    n = math.floor(tonumber(n) or 0)
+    if n < 0 then neg = "-"; n = -n end
+    local s = tostring(n)
+    while true do
+        local k
+        s, k = s:gsub("^(%d+)(%d%d%d)", "%1,%2")
+        if k == 0 then break end
+    end
+    return neg .. s
+end
+
+local function cleanString(str)
+    return (tostring(str):lower():gsub("[^%w]", ""))
+end
+
+local function findFullItemName(cleanName)
+    return cleanNameToFullText[cleanString(cleanName)]
+end
+
+-- Returns nil (not 0) when the item isn't in the API list, so unpriced
+-- items can be flagged rather than silently counted as worthless.
+local function lookupValue(name)
+    local fullText = cleanNameToFullText[cleanString(name)]
+    if not fullText then return nil end
+    return itemValuesMap[fullText] or 0
+end
+
+-- Chroma weapons store ItemName WITHOUT the word "Chroma" (SeerChroma ->
+-- "Seer"), but the record carries an explicit Chroma flag. Trust the flag:
+-- "Chroma Seer" then cleans to "chromaseer", which is how the API names it.
+local function displayNameFor(itemId, itemType)
+    local rec
+    if Sync then
+        if itemType and Sync[itemType] then
+            rec = Sync[itemType][itemId]
+        end
+        if not rec then
+            rec = (Sync.Item and Sync.Item[itemId]) or (Sync.Pets and Sync.Pets[itemId])
+        end
+    end
+    if not rec then return tostring(itemId) end
+
+    local base = rec.ItemName or rec.Name or tostring(itemId)
+    if rec.Chroma and not tostring(base):lower():find("chroma", 1, true) then
+        base = "Chroma " .. base
+    end
+    return base
+end
+
+-- Offer entries are { ItemID, Amount, ItemType }, positional or named.
+local function buildFromOffer(offerTable)
+    local items, total, unpriced = {}, 0, 0
+    if type(offerTable) ~= "table" then return items, total, unpriced end
+
+    for _, entry in pairs(offerTable) do
+        if type(entry) == "table" then
+            local itemId = entry[1] or entry.ItemID
+            local amount = tonumber(entry[2] or entry.Amount) or 1
+            local itemType = entry[3] or entry.ItemType
+            if itemId then
+                local name = displayNameFor(itemId, itemType)
+                local val = lookupValue(name)
+                if val then
+                    total = total + (val * amount)
+                else
+                    unpriced = unpriced + 1
+                end
+                table.insert(items, { name = name, qty = amount, value = val })
+            end
+        end
+    end
+    return items, total, unpriced
+end
+
+-- Fallback used only until the first UpdateTrade fires, i.e. when the
+-- script is executed while a trade is already open.
+local function buildFromUI(offerFrame)
+    local items, total, unpriced = {}, 0, 0
+    local cont = offerFrame and offerFrame:FindFirstChild("Container")
+    if not cont then return items, total, unpriced end
+
+    for i = 1, MAX_SLOTS do
+        local slot = cont:FindFirstChild("NewItem" .. i)
+        if slot and slot.Visible then
+            local nameFrame = slot:FindFirstChild("ItemName")
+            local label = nameFrame and nameFrame:FindFirstChild("Label")
+            if label and label:IsA("TextLabel") then
+                local name = ((label.Text or ""):gsub("<[^>]+>", "")):match("^%s*(.-)%s*$")
+                local lower = name:lower()
+                if name ~= "" and lower ~= "loading" and lower ~= "label" then
+                    -- Each slot has a dedicated Chroma tag frame, which is far
+                    -- more reliable than sniffing descendant names and images.
+                    local tags = slot:FindFirstChild("Tags")
+                    local chromaTag = tags and tags:FindFirstChild("Chroma")
+                    if chromaTag and chromaTag:IsA("GuiObject") and chromaTag.Visible
+                        and not lower:find("chroma", 1, true) then
+                        name = "Chroma " .. name
+                    end
+
+                    local qty = 1
+                    local slotCont = slot:FindFirstChild("Container")
+                    local amtLabel = slotCont and slotCont:FindFirstChild("Amount")
+                    if amtLabel and amtLabel:IsA("TextLabel") then
+                        qty = tonumber((amtLabel.Text or ""):match("x%s*(%d+)")) or 1
+                    end
+
+                    local val = lookupValue(name)
+                    if val then
+                        total = total + (val * qty)
+                    else
+                        unpriced = unpriced + 1
+                    end
+                    table.insert(items, { name = name, qty = qty, value = val })
+                end
+            end
+        end
+    end
+    return items, total, unpriced
+end
+
+--================================================================--
+--                         RENDERING                              --
+--================================================================--
+
+local function liveActive()
+    return liveMode and tradeOpen
+end
+
+local function renderSlots(labels, items)
+    for i = 1, MAX_SLOTS do
+        local it = items[i]
+        if it then
+            local qtyStr = it.qty > 1 and (" x" .. tostring(it.qty)) or ""
+            if it.value then
+                labels[i]:SetText(it.name .. qtyStr .. " - " .. comma(it.value * it.qty))
+                labels[i]:SetColor(Color3.fromRGB(220, 220, 220))
+            else
+                labels[i]:SetText(it.name .. qtyStr .. " - [no value listed]")
+                labels[i]:SetColor(Color3.fromRGB(255, 180, 60))
+            end
+        else
+            labels[i]:SetText("")
+        end
+    end
+end
 
 local function updateResult()
     if yourTotal == 0 and theirTotal == 0 then
@@ -688,11 +884,11 @@ local function updateResult()
         finalResLabel:SetColor(Color3.fromRGB(200, 200, 200))
     elseif yourTotal > theirTotal then
         local loss = yourTotal - theirTotal
-        finalResLabel:SetText("YOU LOSE! (Loss: " .. tostring(loss) .. ")")
+        finalResLabel:SetText("YOU LOSE! (Loss: " .. comma(loss) .. ")")
         finalResLabel:SetColor(Color3.fromRGB(255, 50, 50))
     elseif theirTotal > yourTotal then
         local profit = theirTotal - yourTotal
-        finalResLabel:SetText("YOU WIN! (Profit: " .. tostring(profit) .. ")")
+        finalResLabel:SetText("YOU WIN! (Profit: " .. comma(profit) .. ")")
         finalResLabel:SetColor(Color3.fromRGB(50, 255, 50))
     else
         finalResLabel:SetText("FAIR TRADE! (Equal Value)")
@@ -700,18 +896,163 @@ local function updateResult()
     end
 end
 
+local yourSelectedInv = {}
+local yourSelectedAll = {}
+local theirSelected = {}
+
+local function sumManual(list)
+    local total = 0
+    for _, dropText in ipairs(list) do
+        local cleanDropText = dropText:gsub("%s*%(x%d+%)", "")
+        local qty = tonumber(dropText:match("%(x(%d+)%)")) or 1
+        total = total + ((itemValuesMap[cleanDropText] or 0) * qty)
+    end
+    return total
+end
+
+-- Single entry point for every recalculation. While a trade is open the
+-- live offers drive the totals and the manual lists are ignored, so the
+-- two sources can never be double counted.
+local function recompute()
+    if liveActive() then
+        yourTotal = liveYourTotal
+        theirTotal = liveTheirTotal
+
+        renderSlots(yourSlotLabels, liveYourItems)
+        renderSlots(theirSlotLabels, liveTheirItems)
+
+        local yourSuffix = liveYourUnpriced > 0 and (" (" .. liveYourUnpriced .. " unpriced)") or ""
+        local theirSuffix = liveTheirUnpriced > 0 and (" (" .. liveTheirUnpriced .. " unpriced)") or ""
+        yourValLabel:SetText("Total Value: " .. comma(yourTotal) .. yourSuffix)
+        theirValLabel:SetText("Total Value: " .. comma(theirTotal) .. theirSuffix)
+
+        liveStatusLabel:SetText("Live Mode: reading " .. (haveEvent and "trade data" or "trade window") .. " (manual lists ignored)")
+        liveStatusLabel:SetColor(Color3.fromRGB(50, 255, 50))
+        livePartnerLabel:SetText("Trading with: " .. (livePartner ~= "" and livePartner or "-"))
+    else
+        yourTotal = sumManual(yourSelectedInv) + sumManual(yourSelectedAll)
+        theirTotal = sumManual(theirSelected)
+
+        renderSlots(yourSlotLabels, {})
+        renderSlots(theirSlotLabels, {})
+
+        yourValLabel:SetText("Total Value: " .. comma(yourTotal))
+        theirValLabel:SetText("Total Value: " .. comma(theirTotal))
+
+        if liveMode then
+            liveStatusLabel:SetText("Live Mode: waiting for a trade to open...")
+            liveStatusLabel:SetColor(Color3.fromRGB(200, 200, 200))
+        else
+            liveStatusLabel:SetText("Live Mode: OFF - using manual selections")
+            liveStatusLabel:SetColor(Color3.fromRGB(255, 180, 60))
+        end
+        livePartnerLabel:SetText("Trading with: -")
+    end
+
+    updateResult()
+end
+
+--================================================================--
+--                       LIVE TRADE HOOKS                         --
+--================================================================--
+
+-- Re-running the script must not stack listeners or leave old loops alive.
+_G.__TradeCheckerGen = (_G.__TradeCheckerGen or 0) + 1
+local myGen = _G.__TradeCheckerGen
+
+if _G.__TradeCheckerConns then
+    for _, c in pairs(_G.__TradeCheckerConns) do
+        pcall(function() c:Disconnect() end)
+    end
+end
+_G.__TradeCheckerConns = {}
+
+-- Authoritative source: exact ItemIDs, amounts and chroma flags. The game's
+-- own TradeModule listens to this same event; adding a listener is additive.
+local function onUpdateTrade(state)
+    if myGen ~= _G.__TradeCheckerGen or type(state) ~= "table" then return end
+
+    local meKey, themKey
+    if state.Player1 and state.Player1.Player == LocalPlayer then
+        meKey, themKey = "Player1", "Player2"
+    elseif state.Player2 and state.Player2.Player == LocalPlayer then
+        meKey, themKey = "Player2", "Player1"
+    else
+        return
+    end
+
+    liveYourItems, liveYourTotal, liveYourUnpriced = buildFromOffer(state[meKey].Offer)
+    liveTheirItems, liveTheirTotal, liveTheirUnpriced = buildFromOffer(state[themKey].Offer)
+
+    local them = state[themKey].Player
+    livePartner = (them and them.Name) or livePartner
+    haveEvent = true
+    tradeOpen = true
+
+    recompute()
+end
+
+table.insert(_G.__TradeCheckerConns, TradeRemotes.UpdateTrade.OnClientEvent:Connect(function(state)
+    pcall(onUpdateTrade, state)
+end))
+
+table.insert(_G.__TradeCheckerConns, TradeGUI:GetPropertyChangedSignal("Enabled"):Connect(function()
+    if myGen ~= _G.__TradeCheckerGen then return end
+    tradeOpen = TradeGUI.Enabled
+    if not tradeOpen then
+        haveEvent = false
+        livePartner = ""
+        liveYourItems, liveYourTotal, liveYourUnpriced = {}, 0, 0
+        liveTheirItems, liveTheirTotal, liveTheirUnpriced = {}, 0, 0
+    end
+    recompute()
+end))
+
+-- Safety net: if the script was executed mid-trade, no UpdateTrade fires
+-- until someone changes an offer, so read the window directly until it does.
+task.spawn(function()
+    while myGen == _G.__TradeCheckerGen do
+        if liveMode and TradeGUI.Enabled and not haveEvent then
+            tradeOpen = true
+            local trade = TradeGUI:FindFirstChild("Container")
+            trade = trade and trade:FindFirstChild("Trade")
+            if trade then
+                local yourFrame = trade:FindFirstChild("YourOffer")
+                local theirFrame = trade:FindFirstChild("TheirOffer")
+                liveYourItems, liveYourTotal, liveYourUnpriced = buildFromUI(yourFrame)
+                liveTheirItems, liveTheirTotal, liveTheirUnpriced = buildFromUI(theirFrame)
+
+                local userLabel = theirFrame and theirFrame:FindFirstChild("Username")
+                if userLabel and userLabel:IsA("TextLabel") then
+                    livePartner = (userLabel.Text or ""):gsub("[%(%)]", "")
+                end
+                pcall(recompute)
+            end
+        end
+        task.wait(0.4)
+    end
+end)
+
+resSec:Toggle("Live Mode (read trade window)", true, function(state)
+    liveMode = state
+    recompute()
+end)
+
+--================================================================--
+--                    MANUAL: YOUR OFFER                          --
+--================================================================--
 
 local function getMyInventoryOptions()
-    local pGui = game.Players.LocalPlayer:FindFirstChild("PlayerGui")
-    if not pGui then return dropdownOptions end
+    local pGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not pGui then return dropdownOptions, 0 end
     local inv = pGui:FindFirstChild("MainGUI") and pGui.MainGUI:FindFirstChild("Game") and pGui.MainGUI.Game:FindFirstChild("Inventory")
-    if not inv then return dropdownOptions end
+    if not inv then return dropdownOptions, 0 end
     local itemsContainer = inv:FindFirstChild("Main") and inv.Main:FindFirstChild("Weapons") and inv.Main.Weapons:FindFirstChild("Items") and inv.Main.Weapons.Items:FindFirstChild("Container")
-    if not itemsContainer then return dropdownOptions end
-    
+    if not itemsContainer then return dropdownOptions, 0 end
+
     local foundItems = {}
     local totalValue = 0
-    
+
     local function extractItem(itemFrame)
         if itemFrame:IsA("Frame") and itemFrame.Name:match("NewItem") then
             local itemNameFolder = itemFrame:FindFirstChild("ItemName")
@@ -721,15 +1062,15 @@ local function getMyInventoryOptions()
                     local rawText = label.Text or ""
                     local itemName = rawText:gsub("<[^>]+>", ""):match("^%s*(.-)%s*$")
                     if itemName and itemName ~= "" and itemName:lower() ~= "label" then
-                        
+
                         local multiplier = 1
                         local itemLower = itemName:lower()
                         local multMatch1 = itemLower:match("x%s*(%d+)$")
                         local multMatch2 = itemLower:match("%(x%s*(%d+)%)$")
-                        
+
                         if multMatch1 then multiplier = tonumber(multMatch1) or 1
                         elseif multMatch2 then multiplier = tonumber(multMatch2) or 1 end
-                        
+
                         if multiplier == 1 then
                             for _, desc in ipairs(itemFrame:GetDescendants()) do
                                 if desc:IsA("TextLabel") then
@@ -745,32 +1086,38 @@ local function getMyInventoryOptions()
                                 end
                             end
                         end
-                        
+
                         local cleanName = itemLower:gsub("%s*x%s*%d+$", ""):gsub("%s*%(x%s*%d+%)$", ""):match("^%s*(.-)%s*$")
-                        
+
+                        -- Prefer the dedicated Chroma tag frame when the slot has one.
                         local isChroma = false
-                        local descendants = itemFrame:GetDescendants()
-                        for i = 1, #descendants do
-                            local desc = descendants[i]
-                            local dName = string.lower(desc.Name or "")
-                            if string.find(dName, "chroma", 1, true) then
-                                isChroma = true
-                                break
-                            elseif desc:IsA("TextLabel") and string.find(string.lower(desc.Text or ""), "chroma", 1, true) then
-                                isChroma = true
-                                break
-                            elseif desc:IsA("ImageLabel") and string.find(desc.Image or "", "4589252033", 1, true) then
-                                isChroma = true
-                                break
+                        local tagsFrame = itemFrame:FindFirstChild("Tags")
+                        local chromaTag = tagsFrame and tagsFrame:FindFirstChild("Chroma")
+                        if chromaTag and chromaTag:IsA("GuiObject") then
+                            isChroma = chromaTag.Visible
+                        else
+                            local descendants = itemFrame:GetDescendants()
+                            for i = 1, #descendants do
+                                local desc = descendants[i]
+                                local dName = string.lower(desc.Name or "")
+                                if string.find(dName, "chroma", 1, true) then
+                                    isChroma = true
+                                    break
+                                elseif desc:IsA("TextLabel") and string.find(string.lower(desc.Text or ""), "chroma", 1, true) then
+                                    isChroma = true
+                                    break
+                                elseif desc:IsA("ImageLabel") and string.find(desc.Image or "", "4589252033", 1, true) then
+                                    isChroma = true
+                                    break
+                                end
                             end
                         end
-                        
+
                         if isChroma and not string.find(cleanName, "chroma", 1, true) then
                             cleanName = "chroma " .. cleanName
                         end
-                        
-                        local targetClean = cleanName:gsub("[^%w]", "")
-                        local fullText = cleanNameToFullText[targetClean]
+
+                        local fullText = cleanNameToFullText[cleanString(cleanName)]
                         if fullText then
                             local val = itemValuesMap[fullText] or 0
                             foundItems[fullText] = (foundItems[fullText] or 0) + multiplier
@@ -781,7 +1128,7 @@ local function getMyInventoryOptions()
             end
         end
     end
-    
+
     for _, tab in ipairs(itemsContainer:GetChildren()) do
         if tab:IsA("ScrollingFrame") then
             local tabContainer = tab:FindFirstChild("Container")
@@ -801,9 +1148,9 @@ local function getMyInventoryOptions()
             end
         end
     end
-    
+
     local sorted = {}
-    for item, qty in pairs(foundItems) do 
+    for item, qty in pairs(foundItems) do
         local displayStr = item
         if qty > 1 then
             local namePart, restPart = item:match("^(.-)(%s*%[Val:.*)$")
@@ -813,7 +1160,7 @@ local function getMyInventoryOptions()
                 displayStr = item .. " (x" .. tostring(qty) .. ")"
             end
         end
-        table.insert(sorted, displayStr) 
+        table.insert(sorted, displayStr)
     end
     table.sort(sorted, function(a, b)
         local cleanA = a:gsub("%s*%(x%d+%)", "")
@@ -823,51 +1170,32 @@ local function getMyInventoryOptions()
         if valA == valB then return a < b end
         return valB < valA
     end)
-    
+
     return sorted, totalValue
 end
 
 local myInventoryOptions, myTotalValue = getMyInventoryOptions()
 
-local yourSelectedInv = {}
-local yourSelectedAll = {}
-
-local function updateYourTotal()
-    yourTotal = 0
-    for _, dropText in ipairs(yourSelectedInv) do
-        local cleanDropText = dropText:gsub("%s*%(x%d+%)", "")
-        local qty = tonumber(dropText:match("%(x(%d+)%)")) or 1
-        yourTotal = yourTotal + ((itemValuesMap[cleanDropText] or 0) * qty)
-    end
-    for _, dropText in ipairs(yourSelectedAll) do
-        local cleanDropText = dropText:gsub("%s*%(x%d+%)", "")
-        local qty = tonumber(dropText:match("%(x(%d+)%)")) or 1
-        yourTotal = yourTotal + ((itemValuesMap[cleanDropText] or 0) * qty)
-    end
-    yourValLabel:SetText("Total Value: " .. tostring(yourTotal))
-    updateResult()
-end
-
 local yourDropdownInv = yourSec:Dropdown("Select From Inventory", {}, myInventoryOptions, true, function(selected)
     yourSelectedInv = selected
-    updateYourTotal()
+    recompute()
 end, "Search your owned weapons", true)
 
-local totalInvLabel = yourSec:Label("Total Inventory Value: " .. tostring(myTotalValue))
+local totalInvLabel = yourSec:Label("Total Inventory Value: " .. comma(myTotalValue))
 
 yourSec:Button("Refresh Inventory", function()
     local newOpts, newTotal = getMyInventoryOptions()
     myInventoryOptions = newOpts
     if yourDropdownInv.UpdateChoices then
         yourDropdownInv:UpdateChoices(myInventoryOptions)
-        totalInvLabel:SetText("Total Inventory Value: " .. tostring(newTotal))
-        Lib:Notify("Success", "Inventory refreshed! Total Value: " .. tostring(newTotal), 3, "success")
+        totalInvLabel:SetText("Total Inventory Value: " .. comma(newTotal))
+        Lib:Notify("Success", "Inventory refreshed! Total Value: " .. comma(newTotal), 3, "success")
     end
 end)
 
 local yourDropdownAll = yourSec:Dropdown("Select From All Items", {}, dropdownOptions, true, function(selected)
     yourSelectedAll = selected
-    updateYourTotal()
+    recompute()
 end, "Search any weapon", true)
 
 yourSec:Button("Clear Your Offer", function()
@@ -875,52 +1203,43 @@ yourSec:Button("Clear Your Offer", function()
     if yourDropdownAll.Set then yourDropdownAll:Set({}) end
     yourSelectedInv = {}
     yourSelectedAll = {}
-    updateYourTotal()
+    recompute()
 end)
 
+--================================================================--
+--                    MANUAL: THEIR OFFER                         --
+--================================================================--
+
 local theirDropdown = theirSec:Dropdown("Select Items", {}, dropdownOptions, true, function(selected)
-    theirTotal = 0
-    for _, dropText in ipairs(selected) do
-        local cleanDropText = dropText:gsub("%s*%(x%d+%)", "")
-        local qty = tonumber(dropText:match("%(x(%d+)%)")) or 1
-        theirTotal = theirTotal + ((itemValuesMap[cleanDropText] or 0) * qty)
-    end
-    theirValLabel:SetText("Total Value: " .. tostring(theirTotal))
-    updateResult()
+    theirSelected = selected
+    recompute()
 end, "Search and select their weapons", true)
 
 theirSec:Button("Clear Their Offer", function()
     theirDropdown:Set({})
+    theirSelected = {}
+    recompute()
 end)
 
 theirSec:Divider("Profile Scanner")
-
-local function cleanString(str)
-    return tostring(str):lower():gsub("[^%w]", "")
-end
-
-local function findFullItemName(cleanName)
-    local target = cleanString(cleanName)
-    return cleanNameToFullText[target]
-end
 
 local function getProfileItems()
     local detected = {}
     local pGui = LocalPlayer:FindFirstChild("PlayerGui")
     if not pGui then return detected end
-    
+
     local vp = pGui.MainGUI.Game:FindFirstChild("ViewProfile")
     if not vp then return detected end
-    
+
     local main = vp:FindFirstChild("Main")
     if not main then return detected end
-    
+
     local w = main:FindFirstChild("Weapons")
     if not w then return detected end
-    
+
     local items = w:FindFirstChild("Items")
     if not items then return detected end
-    
+
     for _, child in ipairs(items:GetDescendants()) do
         if child:IsA("Frame") and (child.Name:match("^NewItem") or child.Name:match("^Item_")) then
             local itemNameFrame = child:FindFirstChild("ItemName")
@@ -930,26 +1249,32 @@ local function getProfileItems()
                 local cleanName = rawText:gsub("<[^>]+>", ""):match("^%s*(.-)%s*$")
                 if cleanName and cleanName ~= "" then
                     cleanName = cleanName:lower():gsub("%s*x%s*%d+$", ""):gsub("%s*%(x%s*%d+%)$", "")
-                    
+
                     local isChroma = false
-                    for _, desc in ipairs(child:GetDescendants()) do
-                        local dName = string.lower(desc.Name or "")
-                        if string.find(dName, "chroma", 1, true) then
-                            isChroma = true
-                            break
-                        elseif desc:IsA("TextLabel") and string.find(string.lower(desc.Text or ""), "chroma", 1, true) then
-                            isChroma = true
-                            break
-                        elseif desc:IsA("ImageLabel") and string.find(desc.Image or "", "4589252033", 1, true) then
-                            isChroma = true
-                            break
+                    local tagsFrame = child:FindFirstChild("Tags")
+                    local chromaTag = tagsFrame and tagsFrame:FindFirstChild("Chroma")
+                    if chromaTag and chromaTag:IsA("GuiObject") then
+                        isChroma = chromaTag.Visible
+                    else
+                        for _, desc in ipairs(child:GetDescendants()) do
+                            local dName = string.lower(desc.Name or "")
+                            if string.find(dName, "chroma", 1, true) then
+                                isChroma = true
+                                break
+                            elseif desc:IsA("TextLabel") and string.find(string.lower(desc.Text or ""), "chroma", 1, true) then
+                                isChroma = true
+                                break
+                            elseif desc:IsA("ImageLabel") and string.find(desc.Image or "", "4589252033", 1, true) then
+                                isChroma = true
+                                break
+                            end
                         end
                     end
-                    
+
                     if isChroma and not string.find(cleanName, "chroma", 1, true) then
                         cleanName = "chroma " .. cleanName
                     end
-                    
+
                     table.insert(detected, cleanName)
                 end
             end
@@ -970,7 +1295,7 @@ theirSec:Button("Scan Opened Profile", function()
         Lib:Notify("No items", "No items detected! Ensure you have someone's profile open and clicked 'Inventory'.", 3)
         return
     end
-    
+
     local matchedList = {}
     for _, cleanName in ipairs(detected) do
         local fullText = findFullItemName(cleanName)
@@ -978,7 +1303,7 @@ theirSec:Button("Scan Opened Profile", function()
             table.insert(matchedList, fullText)
         end
     end
-    
+
     table.sort(matchedList, function(a, b)
         local cleanA = a:gsub("%s*%(x%d+%)", "")
         local cleanB = b:gsub("%s*%(x%d+%)", "")
@@ -987,7 +1312,7 @@ theirSec:Button("Scan Opened Profile", function()
         if valA == valB then return a < b end
         return valB < valA
     end)
-    
+
     if #matchedList == 0 then
         if detectedDropdown then
             detectedDropdown:UpdateChoices({})
@@ -1013,7 +1338,7 @@ detectedDropdown = theirSec:Dropdown("Scanned Profile Items", {}, {}, true, func
     elseif type(oldSelected) == "string" and oldSelected ~= "" then
         table.insert(current, oldSelected)
     end
-    
+
     if type(selected) == "table" then
         for _, item in ipairs(selected) do
             local exists = false
@@ -1033,17 +1358,10 @@ detectedDropdown = theirSec:Dropdown("Scanned Profile Items", {}, {}, true, func
             table.insert(current, selected)
         end
     end
-    
+
     theirDropdown:Set(current)
-    
-    theirTotal = 0
-    for _, dropText in ipairs(current) do
-        local cleanDropText = dropText:gsub("%s*%(x%d+%)", "")
-        local qty = tonumber(dropText:match("%(x(%d+)%)")) or 1
-        theirTotal = theirTotal + ((itemValuesMap[cleanDropText] or 0) * qty)
-    end
-    theirValLabel:SetText("Total Value: " .. tostring(theirTotal))
-    updateResult()
+    theirSelected = current
+    recompute()
 end, "Select items to add to their offer", true)
 
 theirSec:Button("Clear Scanned Items", function()
@@ -1058,16 +1376,17 @@ resSec:Button("Clear All Tables", function()
     if yourDropdownAll and yourDropdownAll.Set then yourDropdownAll:Set({}) end
     if theirDropdown and theirDropdown.Set then theirDropdown:Set({}) end
 
-    
     yourSelectedInv = {}
     yourSelectedAll = {}
-    yourTotal = 0
-    theirTotal = 0
-    
-    yourValLabel:SetText("Total Value: 0")
-    theirValLabel:SetText("Total Value: 0")
-    updateResult()
+    theirSelected = {}
+    recompute()
 end)
+
+-- Pick up a trade that is already open at load time.
+tradeOpen = TradeGUI.Enabled
+recompute()
+
+end
 
 --================================================================--
 --                     TAB: ITEM VALUES                           --
